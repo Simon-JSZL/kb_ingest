@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List
+
+from app_config import get_llm_config
+from schemas import DOC_TYPES, KnowledgeItem, ParsedBlock
+
+
+DEFAULT_DOMAIN = "联合运维"
+DEFAULT_OWNER = "联合运维知识库"
+CURRENT_DIR = Path(__file__).resolve().parent
+KB_SPEC_PATH = CURRENT_DIR / "prompts" / "联合运维知识库建立规范.md"
+LLM_MAX_RETRIES = 10
+
+
+def normalize_block(block: ParsedBlock, status: str = "draft") -> List[KnowledgeItem]:
+    if get_llm_config().enabled:
+        items = _normalize_with_llm(block, status=status)
+        if items:
+            return items
+        _abort_llm("model returned no valid knowledge items", block)
+    return [_normalize_heuristically(block, status=status)]
+
+
+def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
+    config = get_llm_config()
+    if not (config.base_url and config.api_key and config.model):
+        _abort_llm("missing base_url, api_key, or model", block)
+
+    prompt = _build_prompt(block, status)
+    started_at = time.monotonic()
+    print(
+        "llm start: "
+        f"doc={block.source_doc} section={block.source_section} "
+        f"chars={len(block.content)} model={config.model}"
+    )
+    try:
+        client_cls = _get_zhipu_client_class()
+    except ImportError as exc:
+        print(f"llm error: cannot load ZhipuAI SDK ({exc})")
+        return []
+
+    client = client_cls(api_key=config.api_key, base_url=config.base_url)
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            print(f"llm request: base_url={config.base_url} attempt={attempt}/{LLM_MAX_RETRIES}")
+            response = client.chat.completions.create(
+                model=config.model,
+                messages=[
+                    {"role": "system", "content": "你是严谨的运维知识库整理助手，只能依据输入原文生成结构化知识条目。"},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=config.max_tokens,
+                temperature=config.temperature,
+                response_format={"type": "json_object"},
+                thinking={"type": "disabled"},
+            )
+        except Exception as exc:
+            elapsed = time.monotonic() - started_at
+            print(f"llm error: {type(exc).__name__} attempt={attempt}/{LLM_MAX_RETRIES} after {elapsed:.1f}s")
+            if attempt >= LLM_MAX_RETRIES:
+                _abort_llm(f"request failed after {LLM_MAX_RETRIES} attempts: {type(exc).__name__}", block)
+            time.sleep(min(2 ** (attempt - 1), 30))
+            continue
+
+        content = _extract_response_content(response)
+        elapsed = time.monotonic() - started_at
+        print(f"llm response: {len(content)} chars in {elapsed:.1f}s attempt={attempt}/{LLM_MAX_RETRIES}")
+        if not content.strip():
+            reasoning = _extract_reasoning_content(response)
+            print(
+                "llm parse failed: empty response content "
+                f"finish_reason={_finish_reason(response)} reasoning_chars={len(reasoning)} "
+                f"response={_response_debug(response)}"
+            )
+            if attempt >= LLM_MAX_RETRIES:
+                _abort_llm("empty response content after 10 attempts", block)
+            time.sleep(min(2 ** (attempt - 1), 30))
+            continue
+
+        parsed = _extract_json(content)
+        if not parsed:
+            print(f"llm parse failed: response is not valid JSON preview={_preview(content)}")
+            if attempt >= LLM_MAX_RETRIES:
+                _abort_llm("response is not valid JSON after 10 attempts", block)
+            time.sleep(min(2 ** (attempt - 1), 30))
+            continue
+
+        raw_items = parsed.get("items") if isinstance(parsed, dict) else parsed
+        if not isinstance(raw_items, list):
+            print("llm parse failed: JSON does not contain an items list")
+            if attempt >= LLM_MAX_RETRIES:
+                _abort_llm("JSON does not contain an items list after 10 attempts", block)
+            time.sleep(min(2 ** (attempt - 1), 30))
+            continue
+
+        items: List[KnowledgeItem] = []
+        for idx, raw in enumerate(raw_items, start=1):
+            if not isinstance(raw, dict):
+                continue
+            items.append(_item_from_dict(raw, block, idx, status))
+        print(f"llm done: generated_items={len(items)} attempt={attempt}/{LLM_MAX_RETRIES}")
+        if items:
+            return items
+        if attempt >= LLM_MAX_RETRIES:
+            _abort_llm("items list contained no valid objects after 10 attempts", block)
+        time.sleep(min(2 ** (attempt - 1), 30))
+
+    _abort_llm("model call failed", block)
+
+
+def _get_zhipu_client_class():
+    try:
+        from zai import ZhipuAiClient
+
+        return ZhipuAiClient
+    except (ImportError, AttributeError):
+        pass
+
+    from zhipuai import ZhipuAI
+
+    return ZhipuAI
+
+
+def _extract_response_content(response) -> str:
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        return str((message or {}).get("content") or "")
+
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    if message is None and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+    if isinstance(message, dict):
+        return str(message.get("content") or "")
+    return str(getattr(message, "content", "") or "")
+
+
+def _extract_reasoning_content(response) -> str:
+    message = _first_message(response)
+    if isinstance(message, dict):
+        return str(message.get("reasoning_content") or "")
+    return str(getattr(message, "reasoning_content", "") or "")
+
+
+def _finish_reason(response) -> str:
+    choice = _first_choice(response)
+    if isinstance(choice, dict):
+        return str(choice.get("finish_reason") or "")
+    return str(getattr(choice, "finish_reason", "") or "")
+
+
+def _first_message(response):
+    choice = _first_choice(response)
+    if isinstance(choice, dict):
+        return choice.get("message")
+    return getattr(choice, "message", None)
+
+
+def _first_choice(response):
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+    else:
+        choices = getattr(response, "choices", None) or []
+    return choices[0] if choices else None
+
+
+def _response_debug(response) -> str:
+    text = repr(response)
+    if len(text) > 300:
+        text = text[:300] + "..."
+    return _preview(text, limit=300)
+
+
+def _abort_llm(message: str, block: ParsedBlock) -> None:
+    print(
+        "ALERT: llm draft failed; aborting. "
+        f"reason={message} doc={block.source_doc} section={block.source_section}"
+    )
+    raise SystemExit(1)
+
+
+def _build_prompt(block: ParsedBlock, status: str) -> str:
+    spec = _read_kb_spec()
+    return f"""
+请将以下原始文档片段整理为标准知识库条目。
+
+要求：
+1. 严格参照《联合运维知识库建立规范》的元数据字段、正文 1-7 节结构、内容切分原则和质量校验要求生成。
+2. 只依据原文理解业务场景、业务模块、角色、标签、风险等级和处置策略，不要依据示例或常见关键词进行套写。
+3. 如果一个片段包含多个独立场景、规则、指标、处置策略，请拆成多个 items。
+4. 每个 item 必须可独立检索、独立回答，颗粒度控制在 800 到 1500 中文字符左右；复杂表格可适当放宽。
+5. 不要编造来源、阈值、角色、日期、版本；原文没有的信息留空、空数组或使用规范允许的通用值。
+6. 涉及表格、阈值、比较符、单位、持续时间、笔数、适用对象时必须保留原始逻辑。
+7. 输出严格 JSON 对象，不要 Markdown 代码围栏，不要解释文字，不要在 JSON 前后添加任何内容。
+8. status 固定为 "{status}"。
+
+doc_type 只能取：
+{", ".join(sorted(DOC_TYPES))}
+
+唯一允许的 JSON 输出格式：
+{{
+  "items": [
+    {{
+      "title": "",
+      "doc_type": "scenario",
+      "business_modules": [],
+      "source_version": "",
+      "risk_level": "low|medium|high|critical",
+      "applicable_roles": [],
+      "tags": [],
+      "body": "Markdown 正文，必须严格包含规范要求的 # 标题 和 ## 1. 适用范围 到 ## 7. 来源依据",
+      "split_reason": "为什么这是独立条目"
+    }}
+  ]
+}}
+
+《联合运维知识库建立规范》：
+{spec}
+
+来源文档：{block.source_doc}
+来源章节：{block.source_section}
+来源页码：{",".join(map(str, block.pages)) if block.pages else ""}
+
+原文：
+{block.content[:12000]}
+""".strip()
+
+
+@lru_cache(maxsize=1)
+def _read_kb_spec() -> str:
+    try:
+        return KB_SPEC_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
+def _extract_json(text: str):
+    text = text.strip()
+    text = _strip_code_fence(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    for candidate in _json_candidates(text):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    fence = re.match(r"^```(?:json|JSON)?\s*(.*?)\s*```$", text, re.S)
+    return fence.group(1).strip() if fence else text
+
+
+def _json_candidates(text: str) -> List[str]:
+    candidates: List[str] = []
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        while start != -1:
+            end = text.rfind(closer)
+            while end > start:
+                candidates.append(text[start:end + 1])
+                end = text.rfind(closer, 0, end)
+            start = text.find(opener, start + 1)
+    return candidates
+
+
+def _preview(text: str, limit: int = 500) -> str:
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _normalize_heuristically(block: ParsedBlock, status: str) -> KnowledgeItem:
+    title = _guess_title(block)
+    doc_type = "biz"
+    body = _build_body(title, block.content)
+    return KnowledgeItem(
+        kb_id=_kb_id(doc_type, title, block.source_doc, 1),
+        title=title,
+        doc_type=doc_type,
+        domain=DEFAULT_DOMAIN,
+        business_modules=[],
+        source_doc=block.source_doc,
+        source_version=_guess_version(block.source_doc + " " + block.content),
+        source_section=block.source_section,
+        effective_date="",
+        owner=DEFAULT_OWNER,
+        confidentiality="内部",
+        risk_level="low",
+        applicable_roles=[],
+        tags=[],
+        status=status,
+        review_status="pending",
+        source_trace=_source_trace(block),
+        body=body,
+    )
+
+
+def _item_from_dict(raw: Dict, block: ParsedBlock, idx: int, status: str) -> KnowledgeItem:
+    title = str(raw.get("title") or _guess_title(block)).strip()
+    doc_type = str(raw.get("doc_type") or "biz").strip()
+    if doc_type not in DOC_TYPES:
+        doc_type = "biz"
+    body = str(raw.get("body") or _build_body(title, block.content)).strip()
+    if not body.startswith("# "):
+        body = f"# {title}\n\n{body}"
+    return KnowledgeItem(
+        kb_id=_kb_id(doc_type, title, block.source_doc, idx),
+        title=title,
+        doc_type=doc_type,
+        domain=DEFAULT_DOMAIN,
+        business_modules=_as_list(raw.get("business_modules")),
+        source_doc=block.source_doc,
+        source_version=str(raw.get("source_version") or _guess_version(block.source_doc + " " + block.content)),
+        source_section=block.source_section,
+        effective_date="",
+        owner=DEFAULT_OWNER,
+        confidentiality="内部",
+        risk_level=_normalize_risk_level(raw.get("risk_level")),
+        applicable_roles=_as_list(raw.get("applicable_roles")),
+        tags=_as_list(raw.get("tags")),
+        status=status,
+        review_status="pending",
+        source_trace=_source_trace(block),
+        body=body,
+    )
+
+
+def _as_list(value) -> List[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if isinstance(value, str) and value.strip():
+        return [v.strip() for v in re.split(r"[,，、]", value) if v.strip()]
+    return []
+
+
+def _guess_title(block: ParsedBlock) -> str:
+    for line in block.content.splitlines():
+        match = re.match(r"^#{1,4}\s+(.+)$", line.strip())
+        if match:
+            return match.group(1).strip()[:80]
+    return block.source_section[:80] or "待整理知识条目"
+
+
+def _normalize_risk_level(value) -> str:
+    risk_level = str(value or "low").strip().lower()
+    return risk_level if risk_level in {"low", "medium", "high", "critical"} else "low"
+
+
+def _guess_version(text: str) -> str:
+    match = re.search(r"[vV]\s*(\d+(?:\.\d+)*)", text)
+    return f"V{match.group(1)}" if match else ""
+
+
+def _build_body(title: str, source_content: str) -> str:
+    content = source_content.strip()
+    content = re.sub(r"^#{1,4}\s+.+\n?", "", content, count=1).strip()
+    return f"""# {title}
+
+## 1. 适用范围
+
+待人工审核确认。以下内容基于来源文档片段整理。
+
+## 2. 规则与条件
+
+{content}
+
+## 3. 处置策略
+
+待人工审核补充或确认。
+
+## 4. 关联指标
+
+待人工审核补充或确认。
+
+## 5. 关联函数
+
+暂无。
+
+## 6. 检索提示
+
+1. “{title}的规则是什么？”
+2. “{title}适用于哪些场景？”
+
+## 7. 来源依据
+
+基于来源章节归纳，需人工复核原文一致性。
+""".strip()
+
+
+def _kb_id(doc_type: str, title: str, source_doc: str, idx: int) -> str:
+    digest = hashlib.md5(f"{source_doc}:{title}:{idx}".encode("utf-8")).hexdigest()[:10]
+    return f"{doc_type}-offline-{digest}-v1"
+
+
+def _source_trace(block: ParsedBlock) -> str:
+    pages = ",".join(map(str, block.pages)) if block.pages else ""
+    return f"section={block.source_section}; pages={pages}".strip("; ")

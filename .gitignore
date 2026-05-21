@@ -1,0 +1,12 @@
+input/*
+parsed/*
+drafts/*
+approved/*
+rejected/*
+!input/.gitkeep
+!input/pdf/.gitkeep
+!input/word/.gitkeep
+!parsed/.gitkeep
+!drafts/.gitkeep
+!approved/.gitkeep
+
