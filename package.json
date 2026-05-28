@@ -1,13 +1,14 @@
 {
   "name": "union_kb_ingest",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Offline knowledge-base ingest helper for PDF, Word, Markdown and TXT documents.",
   "bin": {
-    "union_kb_ingest": "./ingest.py"
+    "union_kb_ingest": "bin/union_kb_ingest"
   },
   "files": [
     "README.md",
     "requirements.txt",
+    "bin/union_kb_ingest",
     "*.py",
     "config/config.yaml",
     "prompts/",

@@ -24,6 +24,13 @@ class LlmConfig:
     temperature: float = 0.1
 
 
+@dataclass(frozen=True)
+class DraftConfig:
+    max_chars: int = 3600
+    context_chars: int = 800
+    outline_max_sections: int = 40
+
+
 @lru_cache(maxsize=1)
 def get_llm_config() -> LlmConfig:
     raw = _read_config().get("llm", {})
@@ -38,6 +45,19 @@ def get_llm_config() -> LlmConfig:
         timeout_seconds=_env_int("KB_LLM_TIMEOUT_SECONDS", raw.get("timeout_seconds"), 120),
         max_tokens=_env_int("KB_LLM_MAX_TOKENS", raw.get("max_tokens"), 4096),
         temperature=_env_float("KB_LLM_TEMPERATURE", raw.get("temperature"), 0.1),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_draft_config() -> DraftConfig:
+    raw = _read_config().get("draft", {})
+    if not isinstance(raw, dict):
+        raw = {}
+
+    return DraftConfig(
+        max_chars=_env_int("KB_DRAFT_MAX_CHARS", raw.get("max_chars"), 3600),
+        context_chars=_env_int("KB_DRAFT_CONTEXT_CHARS", raw.get("context_chars"), 800),
+        outline_max_sections=_env_int("KB_DRAFT_OUTLINE_MAX_SECTIONS", raw.get("outline_max_sections"), 40),
     )
 
 

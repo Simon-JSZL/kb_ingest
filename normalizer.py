@@ -33,7 +33,7 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
     if not (config.base_url and config.api_key and config.model):
         _abort_llm("missing base_url, api_key, or model", block)
 
-    prompt = _build_prompt(block, status)
+    base_prompt = _build_prompt(block, status)
     started_at = time.monotonic()
     print(
         "llm start: "
@@ -45,25 +45,24 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
     except ImportError as exc:
         print(f"llm error: cannot load ZhipuAI SDK ({exc})")
         return []
-
     client = client_cls(api_key=config.api_key, base_url=config.base_url)
+
+    compact_retry = False
     for attempt in range(1, LLM_MAX_RETRIES + 1):
+        prompt = _compact_retry_prompt(base_prompt) if compact_retry else base_prompt
         try:
-            print(f"llm request: base_url={config.base_url} attempt={attempt}/{LLM_MAX_RETRIES}")
-            response = client.chat.completions.create(
-                model=config.model,
-                messages=[
-                    {"role": "system", "content": "你是严谨的运维知识库整理助手，只能依据输入原文生成结构化知识条目。"},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-                response_format={"type": "json_object"},
-                thinking={"type": "disabled"},
+            print(
+                "llm request: "
+                f"provider=zhipu base_url={config.base_url} attempt={attempt}/{LLM_MAX_RETRIES}"
             )
+            response = _create_zhipu_completion(client, config, prompt)
         except Exception as exc:
             elapsed = time.monotonic() - started_at
-            print(f"llm error: {type(exc).__name__} attempt={attempt}/{LLM_MAX_RETRIES} after {elapsed:.1f}s")
+            print(
+                "llm error: "
+                f"{type(exc).__name__} attempt={attempt}/{LLM_MAX_RETRIES} "
+                f"after {elapsed:.1f}s detail={exc}"
+            )
             if attempt >= LLM_MAX_RETRIES:
                 _abort_llm(f"request failed after {LLM_MAX_RETRIES} attempts: {type(exc).__name__}", block)
             time.sleep(min(2 ** (attempt - 1), 30))
@@ -71,12 +70,19 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
 
         content = _extract_response_content(response)
         elapsed = time.monotonic() - started_at
-        print(f"llm response: {len(content)} chars in {elapsed:.1f}s attempt={attempt}/{LLM_MAX_RETRIES}")
+        finish_reason = _finish_reason(response)
+        print(
+            "llm response: "
+            f"{len(content)} chars in {elapsed:.1f}s attempt={attempt}/{LLM_MAX_RETRIES} "
+            f"finish_reason={finish_reason or 'unknown'}"
+        )
+        if content:
+            print(f"llm response content:\n{_preview(content)}")
         if not content.strip():
             reasoning = _extract_reasoning_content(response)
             print(
                 "llm parse failed: empty response content "
-                f"finish_reason={_finish_reason(response)} reasoning_chars={len(reasoning)} "
+                f"finish_reason={finish_reason} reasoning_chars={len(reasoning)} "
                 f"response={_response_debug(response)}"
             )
             if attempt >= LLM_MAX_RETRIES:
@@ -86,15 +92,27 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
 
         parsed = _extract_json(content)
         if not parsed:
-            print(f"llm parse failed: response is not valid JSON preview={_preview(content)}")
+            compact_retry = compact_retry or _looks_truncated(content, finish_reason)
+            print(
+                "llm parse failed: response is not valid JSON "
+                f"finish_reason={finish_reason or 'unknown'} "
+                f"truncated={_looks_truncated(content, finish_reason)} "
+                f"preview={_preview(content)}"
+            )
             if attempt >= LLM_MAX_RETRIES:
                 _abort_llm("response is not valid JSON after 10 attempts", block)
             time.sleep(min(2 ** (attempt - 1), 30))
             continue
 
-        raw_items = parsed.get("items") if isinstance(parsed, dict) else parsed
+        raw_items = _coerce_raw_items(parsed)
         if not isinstance(raw_items, list):
-            print("llm parse failed: JSON does not contain an items list")
+            compact_retry = compact_retry or _looks_truncated(content, finish_reason)
+            print(
+                "llm parse failed: JSON does not contain an items list "
+                f"finish_reason={finish_reason or 'unknown'} "
+                f"truncated={_looks_truncated(content, finish_reason)} "
+                f"top_level={_json_shape(parsed)} preview={_preview(content)}"
+            )
             if attempt >= LLM_MAX_RETRIES:
                 _abort_llm("JSON does not contain an items list after 10 attempts", block)
             time.sleep(min(2 ** (attempt - 1), 30))
@@ -115,7 +133,51 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
     _abort_llm("model call failed", block)
 
 
+def _system_message() -> str:
+    return (
+        "你是严谨的运维知识库整理助手，只能依据输入原文生成结构化知识条目。"
+        "你必须只返回一个 JSON object，根节点必须只有 items 字段，"
+        "且 items 必须是数组。不要返回 Markdown、解释文字或其他根字段。"
+    )
+
+
+def _messages(prompt: str) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": _system_message()},
+        {"role": "user", "content": prompt},
+    ]
+
+
+def _compact_retry_prompt(base_prompt: str) -> str:
+    return (
+        base_prompt
+        + "\n\n重试补充要求：上一次输出疑似过长或结构不完整。"
+        "本次必须只生成 1 个 item，保留规范要求的正文 1-7 节，但每节只写当前原文中最必要、最确定的信息。"
+        "不要省略 JSON 外层 items，不要输出多个条目，不要输出解释文字。"
+    )
+
+
+def _create_zhipu_completion(client, config, prompt: str):
+    return client.chat.completions.create(
+        model=config.model,
+        messages=_messages(prompt),
+        stream=False,
+        max_tokens=config.max_tokens,
+        temperature=config.temperature,
+        do_sample=False,
+        response_format={"type": "json_object"},
+        thinking={"type": "disabled", "clear_thinking": True},
+    )
+
+
 def _get_zhipu_client_class():
+    try:
+        from zai import ZaiClient
+
+        return ZaiClient
+    except (ImportError, AttributeError):
+        pass
+
     try:
         from zai import ZhipuAiClient
 
@@ -177,10 +239,68 @@ def _first_choice(response):
 
 
 def _response_debug(response) -> str:
-    text = repr(response)
-    if len(text) > 300:
-        text = text[:300] + "..."
-    return _preview(text, limit=300)
+    return _preview(repr(response))
+
+
+def _json_shape(value) -> str:
+    if isinstance(value, dict):
+        return f"object keys={list(value.keys())[:10]}"
+    if isinstance(value, list):
+        return f"array len={len(value)}"
+    return type(value).__name__
+
+
+def _coerce_raw_items(parsed):
+    if isinstance(parsed, dict):
+        items = parsed.get("items")
+        if isinstance(items, list):
+            return items
+
+        for key in ("knowledge_items", "records", "data", "result", "results"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                print(f"llm parse notice: using non-standard list field '{key}' as items")
+                return value
+            if isinstance(value, dict):
+                nested = _coerce_raw_items(value)
+                if isinstance(nested, list):
+                    print(f"llm parse notice: using nested field '{key}' as items")
+                    return nested
+
+        if _looks_like_single_item(parsed):
+            print("llm parse notice: wrapping single item object as items[0]")
+            return [parsed]
+
+    if isinstance(parsed, list):
+        print("llm parse notice: wrapping root array as items")
+        return parsed
+
+    return None
+
+
+def _looks_like_single_item(value: Dict) -> bool:
+    required_signal = {"title", "body"}
+    item_fields = {
+        "title",
+        "doc_type",
+        "business_modules",
+        "source_version",
+        "risk_level",
+        "applicable_roles",
+        "tags",
+        "body",
+        "split_reason",
+    }
+    return required_signal.issubset(value.keys()) and len(item_fields.intersection(value.keys())) >= 4
+
+
+def _looks_truncated(content: str, finish_reason: str) -> bool:
+    if finish_reason == "length":
+        return True
+    stripped = content.strip()
+    if not stripped:
+        return False
+    return stripped.count("{") > stripped.count("}") or stripped.count("[") > stripped.count("]")
 
 
 def _abort_llm(message: str, block: ParsedBlock) -> None:
@@ -205,6 +325,9 @@ def _build_prompt(block: ParsedBlock, status: str) -> str:
 6. 涉及表格、阈值、比较符、单位、持续时间、笔数、适用对象时必须保留原始逻辑。
 7. 输出严格 JSON 对象，不要 Markdown 代码围栏，不要解释文字，不要在 JSON 前后添加任何内容。
 8. status 固定为 "{status}"。
+9. JSON 根节点必须严格为一个对象：{{"items": [...]}}。禁止返回单个 item 对象、禁止返回纯数组、禁止返回 result/data/records/knowledge_items 等其他根字段。
+10. 为避免输出被截断，优先生成 1 个覆盖本片段核心内容的综合 item；只有原文明确包含多个相互独立主题时，才拆分为多个 items。
+11. “辅助上下文”只用于理解当前片段在全文中的位置、术语和前后关系；不要把辅助上下文中独有而当前原文没有的事实写成正文依据。
 
 doc_type 只能取：
 {", ".join(sorted(DOC_TYPES))}
@@ -233,8 +356,11 @@ doc_type 只能取：
 来源章节：{block.source_section}
 来源页码：{",".join(map(str, block.pages)) if block.pages else ""}
 
+辅助上下文：
+{block.context or "无"}
+
 原文：
-{block.content[:12000]}
+{block.content}
 """.strip()
 
 
@@ -281,8 +407,8 @@ def _json_candidates(text: str) -> List[str]:
     return candidates
 
 
-def _preview(text: str, limit: int = 500) -> str:
-    return re.sub(r"\s+", " ", text).strip()[:limit]
+def _preview(text: str) -> str:
+    return text.strip()
 
 
 def _normalize_heuristically(block: ParsedBlock, status: str) -> KnowledgeItem:

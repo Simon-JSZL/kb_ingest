@@ -65,6 +65,8 @@ python ingest.py promote
 
 默认目录为 `input/`、`parsed/`、`drafts/`、`approved/` 和 `result/`。只有需要处理其他目录时，才使用 `--input`、`--output` 或 `--result-dir` 覆盖。
 
+`draft` 默认按 `config/config.yaml` 的 `draft.max_chars` 控制单次送入模型的原文长度，并额外提供文档目录和相邻片段摘要作为辅助上下文。这样可以降低私有模型单轮负载，同时尽量保留前后章节关系。命令行仍可用 `--max-chars` 临时覆盖。
+
 ## 大模型配置
 
 默认不强制调用大模型，会使用启发式模板生成 `draft` 文件。
@@ -74,24 +76,29 @@ python ingest.py promote
 ```yaml
 llm:
   enabled: true
-  base_url: "https://your-model-endpoint"
-  api_key: "your-api-key"
-  model: "your-model"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+  api_key: "your-zhipu-api-key"
+  model: "glm-4.7"
   timeout_seconds: 120
-  max_tokens: 4096
+  max_tokens: 8192
   temperature: 0.1
+
+draft:
+  max_chars: 3600
+  context_chars: 800
+  outline_max_sections: 40
 ```
 
 也可以继续使用环境变量覆盖配置文件：
 
 ```bash
 export KB_LLM_ENABLED=true
-export KB_LLM_BASE_URL="https://your-model-endpoint"
-export KB_LLM_API_KEY="your-api-key"
-export KB_LLM_MODEL="your-model"
+export KB_LLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4/"
+export KB_LLM_API_KEY="your-zhipu-api-key"
+export KB_LLM_MODEL="glm-4.7"
 ```
 
-`base_url` 必须填写完整的大模型调用地址，工具不会自动拼接任何路径。工具不 import 项目 `src` 代码。
+工具通过 ZhipuAI SDK 调用 GLM，不再包含 OpenAI 调用路径。`base_url` 使用 ZhipuAI SDK 的服务根地址即可。工具不 import 项目 `src` 代码。
 
 ## 与线上项目的关系
 

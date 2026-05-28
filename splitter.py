@@ -34,6 +34,7 @@ def _merge_parent_child_blocks(blocks: List[ParsedBlock]) -> List[ParsedBlock]:
                 content=f"{current.content.rstrip()}\n\n{block.content.strip()}",
                 pages=sorted(set(current.pages + block.pages)),
                 order=current.order,
+                context=current.context,
             )
             continue
 
@@ -79,6 +80,7 @@ def _split_one(block: ParsedBlock, max_chars: int) -> List[ParsedBlock]:
             content=text,
             pages=block.pages,
             order=block.order * 100 + idx,
+            context=block.context,
         ))
     return output
 

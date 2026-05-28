@@ -1,8 +1,13 @@
 llm:
-  enabled: false
+  enabled: true
   timeout_seconds: 120
-  max_tokens: 4096
+  max_tokens: 8192
   temperature: 0.1
-  api_key: "your-api-key"          # API Key
-  model: "your-model"              # 模型名称
-  base_url: "https://your-model-endpoint"  # 完整模型调用地址
+  api_key: "15f066c4509845038027ea5746524af5.w4CLSC6ODiKVC1wK"
+  model: "GLM-4.7-Flash"
+  base_url: "https://open.bigmodel.cn/api/paas/v4/"
+
+draft:
+  max_chars: 3600
+  context_chars: 800
+  outline_max_sections: 40

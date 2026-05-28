@@ -24,6 +24,7 @@ class ParsedBlock:
     content: str
     pages: List[int] = field(default_factory=list)
     order: int = 0
+    context: str = ""
 
 
 @dataclass
@@ -82,4 +83,3 @@ class ValidationIssue:
     path: Path
     level: str
     message: str
-

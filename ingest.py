@@ -1,16 +1,20 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
 import shutil
 import sys
 from pathlib import Path
+from typing import List
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
+from app_config import get_draft_config
 from normalizer import normalize_block
 from parser import iter_input_files, parse_document
+from schemas import ParsedBlock
 from splitter import split_blocks
 from validator import validate_dir
 from writer import write_item
@@ -51,10 +55,17 @@ def cmd_draft(args) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     total_items = 0
+    draft_config = get_draft_config()
+    max_chars = args.max_chars or draft_config.max_chars
     files = iter_input_files(input_path)
     for path in files:
         parsed = parse_document(path)
-        blocks = split_blocks(parsed.blocks, max_chars=args.max_chars)
+        blocks = split_blocks(parsed.blocks, max_chars=max_chars)
+        blocks = _attach_block_context(
+            blocks,
+            context_chars=draft_config.context_chars,
+            outline_max_sections=draft_config.outline_max_sections,
+        )
         for block in blocks:
             for item in normalize_block(block, status="draft"):
                 write_item(item, output_dir)
@@ -95,6 +106,67 @@ def _clear_generated_files(*dirs: Path) -> None:
             print(f"deleted: {path}")
 
 
+def _attach_block_context(
+    blocks: List[ParsedBlock],
+    context_chars: int,
+    outline_max_sections: int,
+) -> List[ParsedBlock]:
+    if context_chars <= 0:
+        return blocks
+
+    outline = _document_outline(blocks, outline_max_sections)
+    output: List[ParsedBlock] = []
+    for idx, block in enumerate(blocks):
+        parts = []
+        if outline:
+            parts.append(f"文档章节目录：\n{outline}")
+        if idx > 0:
+            parts.append(
+                "上一片段摘要：\n"
+                f"章节：{blocks[idx - 1].source_section}\n"
+                f"{_compact_context_text(blocks[idx - 1].content, context_chars // 2)}"
+            )
+        if idx + 1 < len(blocks):
+            parts.append(
+                "下一片段摘要：\n"
+                f"章节：{blocks[idx + 1].source_section}\n"
+                f"{_compact_context_text(blocks[idx + 1].content, context_chars // 2)}"
+            )
+        output.append(ParsedBlock(
+            source_doc=block.source_doc,
+            source_section=block.source_section,
+            content=block.content,
+            pages=block.pages,
+            order=block.order,
+            context="\n\n".join(parts),
+        ))
+    return output
+
+
+def _document_outline(blocks: List[ParsedBlock], max_sections: int) -> str:
+    sections = []
+    seen = set()
+    for block in blocks:
+        section = block.source_section.strip()
+        if not section or section in seen:
+            continue
+        seen.add(section)
+        sections.append(f"- {section}")
+        if len(sections) >= max_sections:
+            remaining = len(blocks) - len(sections)
+            if remaining > 0:
+                sections.append(f"- ... 其余 {remaining} 个片段")
+            break
+    return "\n".join(sections)
+
+
+def _compact_context_text(text: str, limit: int) -> str:
+    compact = " ".join(text.split())
+    if limit <= 0 or len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip() + "..."
+
+
 def cmd_validate(args) -> int:
     issues = validate_dir(Path(args.input))
     for issue in issues:
@@ -131,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft_cmd.add_argument("--output", default=str(CURRENT_DIR / "drafts"))
     draft_cmd.add_argument("--approved-dir", default=str(CURRENT_DIR / "approved"))
     draft_cmd.add_argument("--result-dir", default=str(CURRENT_DIR / "result"))
-    draft_cmd.add_argument("--max-chars", type=int, default=8000)
+    draft_cmd.add_argument("--max-chars", type=int, default=None)
     draft_cmd.set_defaults(func=cmd_draft)
 
     validate_cmd = sub.add_parser("validate", help="Validate generated Markdown files.")
