@@ -37,6 +37,21 @@ def parse_document(path: Path) -> ParsedDocument:
         raise ValueError(f"Unsupported file type: {path}")
 
     blocks = _markdown_to_blocks(path.name, markdown)
+    category, category_description, category_keywords = _document_category_profile(path, markdown, blocks)
+    blocks = [
+        ParsedBlock(
+            source_doc=block.source_doc,
+            source_section=block.source_section,
+            content=block.content,
+            pages=block.pages,
+            order=block.order,
+            context=block.context,
+            category=category,
+            category_description=category_description,
+            category_keywords=category_keywords,
+        )
+        for block in blocks
+    ]
     return ParsedDocument(
         source_path=path,
         source_doc=path.name,
@@ -259,6 +274,96 @@ def _markdown_to_blocks(source_doc: str, markdown: str) -> List[ParsedBlock]:
     if not blocks and normalized.strip():
         blocks.append(ParsedBlock(source_doc=source_doc, source_section="全文", content=normalized.strip()))
     return blocks
+
+
+def _document_category_profile(path: Path, markdown: str, blocks: List[ParsedBlock]) -> tuple[str, str, List[str]]:
+    category = _document_category(path, markdown, blocks)
+    headings = _document_headings(markdown, blocks)
+    keywords = _category_keywords(category, headings)
+    description = _category_description(category, headings)
+    return category, description, keywords
+
+
+def _document_category(path: Path, markdown: str, blocks: List[ParsedBlock]) -> str:
+    for line in markdown.splitlines()[:80]:
+        match = re.match(r"^#\s+(.+)$", line.strip())
+        if match:
+            return _clean_category(match.group(1))
+
+    if blocks:
+        first_section = blocks[0].source_section
+        if first_section and not first_section.startswith("文档片段"):
+            return _clean_category(first_section)
+
+    return _clean_category(path.stem)
+
+
+def _document_headings(markdown: str, blocks: List[ParsedBlock]) -> List[str]:
+    headings: List[str] = []
+    for line in markdown.splitlines():
+        match = re.match(r"^#{1,4}\s+(.+)$", line.strip())
+        if match and _is_useful_category_heading(match.group(1)):
+            headings.append(_clean_category(match.group(1)))
+    if not headings:
+        headings = [
+            _clean_category(block.source_section)
+            for block in blocks[:12]
+            if _is_useful_category_heading(block.source_section)
+        ]
+    return _unique_nonempty(headings)[:12]
+
+
+def _category_description(category: str, headings: List[str]) -> str:
+    useful = [h for h in headings if h and h != category][:8]
+    if useful:
+        return f"本分类来源于《{category}》，主要覆盖：{'；'.join(useful)}。"
+    return f"本分类来源于《{category}》，用于承载该源文件所属业务场景、规则、指标、处置要求和相关知识条目。"
+
+
+def _category_keywords(category: str, headings: List[str]) -> List[str]:
+    seeds = [category] + headings
+    keywords: List[str] = []
+    for seed in seeds:
+        for part in re.split(r"[\s,，、;；/／|｜（）()《》【】\\-]+", seed):
+            part = _clean_category(part)
+            if len(part) >= 2:
+                keywords.append(part)
+        if seed:
+            keywords.append(seed)
+    return _unique_nonempty(keywords)[:16]
+
+
+def _is_useful_category_heading(value: str) -> bool:
+    cleaned = _clean_category(value)
+    if not cleaned:
+        return False
+    if re.fullmatch(r"(?:\d+|[A-ZＡ-Ｚ])(?:\.\d+)*", cleaned):
+        return False
+    if cleaned in {"目录", "前言", "范围", "术语和定义", "规范性引用文件", "未分类"}:
+        return False
+    if cleaned.startswith(("Q/", "ICS", "CCS")):
+        return False
+    if "\\" in cleaned or "fonttbl" in cleaned or "ansi" in cleaned:
+        return False
+    return True
+
+
+def _unique_nonempty(values: List[str]) -> List[str]:
+    seen = set()
+    output = []
+    for value in values:
+        cleaned = _clean_category(value)
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        output.append(cleaned)
+    return output
+
+
+def _clean_category(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip(" #\t\r\n")
+    value = re.sub(r"^(文档片段|全文)\s*\d*", "", value).strip()
+    return value[:80] or "未分类"
 
 
 def _recover_headings(markdown: str) -> str:

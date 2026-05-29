@@ -8,7 +8,7 @@
 2. 通过 Docling slim 的离线文本解析能力生成统一 Markdown 中间格式。
 3. 按章节、场景、规则、指标等粒度切割。
 4. 可选调用大模型，把内容整理为项目知识库规范要求的 Markdown 文件。
-5. 默认生成 `status: draft` 草稿，不进入现有 RAG 检索。
+5. 默认生成可直接交给知识库项目使用的 `status: active` Markdown 文件。
 
 启用大模型时，工具会把 `prompts/联合运维知识库建立规范.md` 作为格式和质量约束放入提示词，要求模型依据原文语义判断业务场景、模块、角色、标签和风险等级。代码中的启发式生成只作为未启用大模型或调用失败时的兜底，不使用预设业务关键词去指导大模型输出。
 
@@ -37,13 +37,13 @@ python -m pip install -r requirements.txt
 input/
 ```
 
-生成草稿：
+生成知识库文件：
 
 ```bash
 python ingest.py draft
 ```
 
-如果 `drafts/` 中已有草稿文件，命令会先询问是否覆盖。选择 `y` 后会清空 `drafts/`、`approved/` 和 `result/` 中已有生成文件，再重新生成；选择其他内容会直接退出，避免多次生成结果相互影响。
+如果 `result/` 中已有生成文件，命令会先询问是否覆盖。选择 `y` 后会清空 `result/` 中已有生成文件，再重新生成；选择其他内容会直接退出，避免多次生成结果相互影响。
 
 只解析为中间 Markdown：
 
@@ -51,25 +51,21 @@ python ingest.py draft
 python ingest.py parse
 ```
 
-校验草稿：
+校验生成结果：
 
 ```bash
 python ingest.py validate
 ```
 
-审核后复制到知识库：
-
-```bash
-python ingest.py promote
-```
-
-默认目录为 `input/`、`parsed/`、`drafts/`、`approved/` 和 `result/`。只有需要处理其他目录时，才使用 `--input`、`--output` 或 `--result-dir` 覆盖。
+默认目录为 `input/`、`parsed/` 和 `result/`。只有需要处理其他目录时，才使用 `--input` 或 `--output` 覆盖。
 
 `draft` 默认按 `config/config.yaml` 的 `draft.max_chars` 控制单次送入模型的原文长度，并额外提供文档目录和相邻片段摘要作为辅助上下文。这样可以降低私有模型单轮负载，同时尽量保留前后章节关系。命令行仍可用 `--max-chars` 临时覆盖。
 
+每条知识库文件会写入分类画像元数据：`category`、`category_description` 和 `category_keywords`。这些字段优先来自源文件一级标题、首页标题、章节目录和文件名，用于标识一个批次/业务场景的大类。后续 RAG 入库和检索时，应把这些字段写入向量库 metadata，并用于分类过滤、查询路由或重排加权，降低不同场景之间因为相似词命中而串场的概率。
+
 ## 大模型配置
 
-默认不强制调用大模型，会使用启发式模板生成 `draft` 文件。
+默认不强制调用大模型，会使用启发式模板生成知识库文件。
 
 如果要启用大模型整理，修改 `config/config.yaml`：
 
@@ -102,6 +98,6 @@ export KB_LLM_MODEL="glm-4.7"
 
 ## 与线上项目的关系
 
-这个工具只产出符合规范的 `*.md` 文件。确认无误后，人工把 `status: draft` 改为 `active`，再放入 `result/`，后续由线上知识库加载流程处理。
+这个工具只产出符合规范的 `*.md` 文件到 `result/`，后续由线上知识库加载流程处理。
 
 建议线上打包时排除整个 `tools/kb_ingest` 目录。

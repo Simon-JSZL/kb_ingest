@@ -11,13 +11,10 @@ input/**/*.md
 input/**/*.markdown
 input/**/*.txt
 parsed/**
-drafts/**
-approved/**
 result/**
 knowledge/**
 !input/.gitkeep
 !input/pdf/.gitkeep
 !input/word/.gitkeep
 !parsed/.gitkeep
-!drafts/.gitkeep
-!approved/.gitkeep
+!result/.gitkeep

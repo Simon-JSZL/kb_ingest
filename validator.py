@@ -14,6 +14,9 @@ REQUIRED_FIELDS = [
     "title",
     "doc_type",
     "domain",
+    "category",
+    "category_description",
+    "category_keywords",
     "business_modules",
     "source_doc",
     "source_version",
@@ -48,17 +51,28 @@ def validate_file(path: Path) -> List[ValidationIssue]:
     if metadata.get("doc_type") not in DOC_TYPES:
         issues.append(ValidationIssue(path, "error", f"doc_type 不合法: {metadata.get('doc_type')}"))
 
-    if metadata.get("status") == "active" and metadata.get("review_status") != "approved":
-        issues.append(ValidationIssue(path, "warning", "active 条目建议先设置 review_status: approved"))
-
     if len(body) > 3000:
         issues.append(ValidationIssue(path, "warning", f"正文较长，建议继续拆分: {len(body)} 字符"))
     if len(body) < 200:
         issues.append(ValidationIssue(path, "warning", f"正文较短，可能信息不足: {len(body)} 字符"))
 
     headings = re.findall(r"^##\s+", body, re.M)
-    if len(headings) < 3:
-        issues.append(ValidationIssue(path, "warning", "二级标题过少，可能未遵照标准结构"))
+    if len(headings) < 9:
+        issues.append(ValidationIssue(path, "warning", "二级标题少于 9 个，可能未遵照标准知识库结构"))
+
+    for idx, title in enumerate((
+        "适用范围",
+        "规则",
+        "标准",
+        "处置",
+        "参考",
+        "关联函数",
+        "模型回答要求",
+        "检索提示",
+        "来源依据",
+    ), start=1):
+        if not re.search(rf"^##\s+{idx}\.\s+.*{title}", body, re.M):
+            issues.append(ValidationIssue(path, "warning", f"缺少或未对齐章节: ## {idx}. {title}"))
 
     return issues
 
@@ -69,4 +83,3 @@ def _read_markdown(path: Path) -> Tuple[Dict, str]:
     if not match:
         raise ValueError("缺少 YAML Front Matter")
     return yaml.safe_load(match.group(1)) or {}, match.group(2).strip()
-

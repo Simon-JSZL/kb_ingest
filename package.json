@@ -1,6 +1,6 @@
 {
   "name": "union_kb_ingest",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Offline knowledge-base ingest helper for PDF, Word, Markdown and TXT documents.",
   "bin": {
     "union_kb_ingest": "bin/union_kb_ingest"
@@ -9,6 +9,7 @@
     "README.md",
     "requirements.txt",
     "bin/union_kb_ingest",
+    "ArkKickidcService.java",
     "*.py",
     "config/config.yaml",
     "prompts/",
@@ -16,8 +17,7 @@
     "input/pdf/.gitkeep",
     "input/word/.gitkeep",
     "parsed/.gitkeep",
-    "drafts/.gitkeep",
-    "approved/.gitkeep"
+    "result/.gitkeep"
   ],
   "scripts": {
     "pack:check": "npm pack --dry-run"

@@ -16,6 +16,7 @@ DEFAULT_DOMAIN = "联合运维"
 DEFAULT_OWNER = "联合运维知识库"
 CURRENT_DIR = Path(__file__).resolve().parent
 KB_SPEC_PATH = CURRENT_DIR / "prompts" / "联合运维知识库建立规范.md"
+TOOLS_PATH = CURRENT_DIR / "input" / "function" / "tools.json"
 LLM_MAX_RETRIES = 10
 
 
@@ -152,7 +153,7 @@ def _compact_retry_prompt(base_prompt: str) -> str:
     return (
         base_prompt
         + "\n\n重试补充要求：上一次输出疑似过长或结构不完整。"
-        "本次必须只生成 1 个 item，保留规范要求的正文 1-7 节，但每节只写当前原文中最必要、最确定的信息。"
+        "本次必须只生成 1 个 item，保留规范要求的正文 1-9 节，但每节只写当前原文中最必要、最确定的信息。"
         "不要省略 JSON 外层 items，不要输出多个条目，不要输出解释文字。"
     )
 
@@ -317,7 +318,7 @@ def _build_prompt(block: ParsedBlock, status: str) -> str:
 请将以下原始文档片段整理为标准知识库条目。
 
 要求：
-1. 严格参照《联合运维知识库建立规范》的元数据字段、正文 1-7 节结构、内容切分原则和质量校验要求生成。
+1. 严格参照《联合运维知识库建立规范》的元数据字段、正文 1-9 节结构、内容切分原则和质量校验要求生成。
 2. 只依据原文理解业务场景、业务模块、角色、标签、风险等级和处置策略，不要依据示例或常见关键词进行套写。
 3. 如果一个片段包含多个独立场景、规则、指标、处置策略，请拆成多个 items。
 4. 每个 item 必须可独立检索、独立回答，颗粒度控制在 800 到 1500 中文字符左右；复杂表格可适当放宽。
@@ -328,6 +329,9 @@ def _build_prompt(block: ParsedBlock, status: str) -> str:
 9. JSON 根节点必须严格为一个对象：{{"items": [...]}}。禁止返回单个 item 对象、禁止返回纯数组、禁止返回 result/data/records/knowledge_items 等其他根字段。
 10. 为避免输出被截断，优先生成 1 个覆盖本片段核心内容的综合 item；只有原文明确包含多个相互独立主题时，才拆分为多个 items。
 11. “辅助上下文”只用于理解当前片段在全文中的位置、术语和前后关系；不要把辅助上下文中独有而当前原文没有的事实写成正文依据。
+12. body 必须对齐目标知识库样式：YAML Front Matter 由程序生成，body 只输出 Markdown 正文；正文必须包含 # 标题，以及 ## 1. 适用范围、## 2. 规则原则、## 3. 标准条件、## 4. 处置要求、## 5. 补充参考场景、## 6. 关联函数、## 7. 模型回答要求、## 8. 检索提示、## 9. 来源依据。
+13. 如果某类条目不适用某一节，也必须保留该节标题，并写“暂无”或“原文未明确说明”，不要删除章节。
+14. “关联函数”只能从“可用工具列表”中选择。只有当工具 description/trigger/input_schema 与当前知识条目明确相关时，才按指定 YAML 格式写入；不确定时写“暂无”，等待人工兜底。
 
 doc_type 只能取：
 {", ".join(sorted(DOC_TYPES))}
@@ -338,12 +342,15 @@ doc_type 只能取：
     {{
       "title": "",
       "doc_type": "scenario",
+      "category": "",
+      "category_description": "",
+      "category_keywords": [],
       "business_modules": [],
       "source_version": "",
       "risk_level": "low|medium|high|critical",
       "applicable_roles": [],
       "tags": [],
-      "body": "Markdown 正文，必须严格包含规范要求的 # 标题 和 ## 1. 适用范围 到 ## 7. 来源依据",
+      "body": "Markdown 正文，必须严格包含 # 标题，以及 ## 1. 适用范围、## 2. 规则原则、## 3. 标准条件、## 4. 处置要求、## 5. 补充参考场景、## 6. 关联函数、## 7. 模型回答要求、## 8. 检索提示、## 9. 来源依据",
       "split_reason": "为什么这是独立条目"
     }}
   ]
@@ -352,7 +359,13 @@ doc_type 只能取：
 《联合运维知识库建立规范》：
 {spec}
 
+可用工具列表：
+{_read_tool_spec()}
+
 来源文档：{block.source_doc}
+知识大类：{block.category or "未分类"}
+大类说明：{block.category_description or "无"}
+大类关键词：{", ".join(block.category_keywords) if block.category_keywords else "无"}
 来源章节：{block.source_section}
 来源页码：{",".join(map(str, block.pages)) if block.pages else ""}
 
@@ -370,6 +383,39 @@ def _read_kb_spec() -> str:
         return KB_SPEC_PATH.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         return ""
+
+
+@lru_cache(maxsize=1)
+def _read_tool_spec() -> str:
+    try:
+        raw = json.loads(TOOLS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "无"
+    if not isinstance(raw, list) or not raw:
+        return "无"
+    chunks = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        chunks.append(_format_tool_for_prompt(item))
+    return "\n\n".join(chunks) if chunks else "无"
+
+
+def _format_tool_for_prompt(item: Dict) -> str:
+    input_schema = item.get("input_schema") if isinstance(item.get("input_schema"), dict) else {}
+    output_schema = item.get("output_schema") if isinstance(item.get("output_schema"), dict) else {}
+    return "\n".join([
+        f"- function_name: {item.get('name', '')}",
+        f"  display_name: {item.get('display_name', '')}",
+        "  function_type: read",
+        f"  description: {item.get('description', '')}",
+        f"  trigger: {item.get('trigger', '')}",
+        "  risk_level: low",
+        "  requires_confirmation: false",
+        "  required_permissions: []",
+        f"  input_schema: {json.dumps(input_schema.get('properties', {}), ensure_ascii=False)}",
+        f"  output_schema: {json.dumps(output_schema.get('properties', {}), ensure_ascii=False)}",
+    ])
 
 
 def _extract_json(text: str):
@@ -420,6 +466,9 @@ def _normalize_heuristically(block: ParsedBlock, status: str) -> KnowledgeItem:
         title=title,
         doc_type=doc_type,
         domain=DEFAULT_DOMAIN,
+        category=block.category or _guess_category(block),
+        category_description=block.category_description or _guess_category_description(block),
+        category_keywords=block.category_keywords or [block.category or _guess_category(block)],
         business_modules=[],
         source_doc=block.source_doc,
         source_version=_guess_version(block.source_doc + " " + block.content),
@@ -450,6 +499,13 @@ def _item_from_dict(raw: Dict, block: ParsedBlock, idx: int, status: str) -> Kno
         title=title,
         doc_type=doc_type,
         domain=DEFAULT_DOMAIN,
+        category=str(raw.get("category") or block.category or _guess_category(block)).strip(),
+        category_description=str(
+            raw.get("category_description") or block.category_description or _guess_category_description(block)
+        ).strip(),
+        category_keywords=_as_list(raw.get("category_keywords")) or block.category_keywords or [
+            str(raw.get("category") or block.category or _guess_category(block)).strip()
+        ],
         business_modules=_as_list(raw.get("business_modules")),
         source_doc=block.source_doc,
         source_version=str(raw.get("source_version") or _guess_version(block.source_doc + " " + block.content)),
@@ -483,6 +539,18 @@ def _guess_title(block: ParsedBlock) -> str:
     return block.source_section[:80] or "待整理知识条目"
 
 
+def _guess_category(block: ParsedBlock) -> str:
+    if block.category:
+        return block.category
+    title = block.source_doc.rsplit(".", 1)[0].strip()
+    return title[:80] or "未分类"
+
+
+def _guess_category_description(block: ParsedBlock) -> str:
+    category = _guess_category(block)
+    return f"本分类来源于《{category}》，用于承载该源文件生成的知识库条目。"
+
+
 def _normalize_risk_level(value) -> str:
     risk_level = str(value or "low").strip().lower()
     return risk_level if risk_level in {"low", "medium", "high", "critical"} else "low"
@@ -502,28 +570,36 @@ def _build_body(title: str, source_content: str) -> str:
 
 待人工审核确认。以下内容基于来源文档片段整理。
 
-## 2. 规则与条件
+## 2. 规则原则
 
 {content}
 
-## 3. 处置策略
+## 3. 标准条件
+
+待人工审核补充或确认，涉及阈值、单位、持续时间、笔数和比较关系时应使用表格表达。
+
+## 4. 处置要求
 
 待人工审核补充或确认。
 
-## 4. 关联指标
-
-待人工审核补充或确认。
-
-## 5. 关联函数
+## 5. 补充参考场景
 
 暂无。
 
-## 6. 检索提示
+## 6. 关联函数
+
+暂无。
+
+## 7. 模型回答要求
+
+当用户咨询本条目相关问题时，模型应基于来源依据回答；缺少关键数据时，应说明需要补充的信息，不得主观推断。
+
+## 8. 检索提示
 
 1. “{title}的规则是什么？”
 2. “{title}适用于哪些场景？”
 
-## 7. 来源依据
+## 9. 来源依据
 
 基于来源章节归纳，需人工复核原文一致性。
 """.strip()
