@@ -61,7 +61,9 @@ python ingest.py validate
 
 `draft` 默认按 `config/config.yaml` 的 `draft.max_chars` 控制单次送入模型的原文长度，并额外提供文档目录和相邻片段摘要作为辅助上下文。这样可以降低私有模型单轮负载，同时尽量保留前后章节关系。命令行仍可用 `--max-chars` 临时覆盖。
 
-每条知识库文件会写入分类画像元数据：`category`、`category_description` 和 `category_keywords`。这些字段优先来自源文件一级标题、首页标题、章节目录和文件名，用于标识一个批次/业务场景的大类。后续 RAG 入库和检索时，应把这些字段写入向量库 metadata，并用于分类过滤、查询路由或重排加权，降低不同场景之间因为相似词命中而串场的概率。
+每条知识库文件会写入分类画像元数据：`category`、`subcategory`、`category_keywords` 和 `related_items`。这些字段优先来自源文件一级标题、首页标题、章节目录、文件名、当前小类正文和关联小类语义，用于标识知识大类、小类、关键词和条目间关系。后续 RAG 入库和检索时，应把这些字段写入向量库 metadata，并用于分类过滤、查询路由或重排加权，降低不同场景之间因为相似词命中而串场的概率。
+
+生成结果会按原始输入遍历顺序写入 `source_order`，并用 `000001-...md` 这样的文件名前缀保持目录排序与原文从上到下的顺序一致。页码只写入 Front Matter 的 `source_pages`/`source_trace` 和正文 `## 5. 来源依据`，不会进入正文 `## 1. 核心内容` 到 `## 4. 关联能力`。
 
 ## 大模型配置
 
@@ -94,7 +96,7 @@ export KB_LLM_API_KEY="your-zhipu-api-key"
 export KB_LLM_MODEL="glm-4.7"
 ```
 
-工具通过 ZhipuAI SDK 调用 GLM，不再包含 OpenAI 调用路径。`base_url` 使用 ZhipuAI SDK 的服务根地址即可。工具不 import 项目 `src` 代码。
+工具通过 Z.AI 新版 Python SDK 调用中文智谱开放平台 GLM，依赖固定为 `zai-sdk==0.2.2`，客户端固定使用官方中文写法 `from zai import ZhipuAiClient`，`base_url` 使用 `https://open.bigmodel.cn/api/paas/v4/`。工具不再包含旧 `zhipuai` SDK、国际版 `ZaiClient` 或 OpenAI 调用路径，也不 import 项目 `src` 代码。
 
 ## 与线上项目的关系
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import List
 
 from schemas import ParsedBlock
 
 
 def split_blocks(blocks: List[ParsedBlock], max_chars: int = 8000) -> List[ParsedBlock]:
+    """合并和切分解析片段以适配生成长度。"""
     result: List[ParsedBlock] = []
     for block in _merge_parent_child_blocks(blocks):
         result.extend(_split_one(block, max_chars=max_chars))
@@ -14,6 +16,7 @@ def split_blocks(blocks: List[ParsedBlock], max_chars: int = 8000) -> List[Parse
 
 
 def _merge_parent_child_blocks(blocks: List[ParsedBlock]) -> List[ParsedBlock]:
+    """把短父章节与其子章节合并。"""
     merged: List[ParsedBlock] = []
     current: ParsedBlock | None = None
     current_prefix = ""
@@ -28,16 +31,10 @@ def _merge_parent_child_blocks(blocks: List[ParsedBlock]) -> List[ParsedBlock]:
             continue
 
         if current and current_prefix and _is_child_section(current_prefix, block.source_section):
-            current = ParsedBlock(
-                source_doc=current.source_doc,
-                source_section=current.source_section,
+            current = replace(
+                current,
                 content=f"{current.content.rstrip()}\n\n{block.content.strip()}",
                 pages=sorted(set(current.pages + block.pages)),
-                order=current.order,
-                context=current.context,
-                category=current.category,
-                category_description=current.category_description,
-                category_keywords=current.category_keywords,
             )
             continue
 
@@ -53,19 +50,23 @@ def _merge_parent_child_blocks(blocks: List[ParsedBlock]) -> List[ParsedBlock]:
 
 
 def _section_prefix(title: str) -> str:
+    """提取章节号的父级前缀。"""
     match = re.match(r"^(\d+\.\d+)(?!\.)", title.strip())
     return match.group(1) if match else ""
 
 
 def _is_parent_section(prefix: str, content: str) -> bool:
+    """判断片段是否像需要合并的父章节。"""
     return bool(prefix) and len(content.strip()) < 120
 
 
 def _is_child_section(parent_prefix: str, title: str) -> bool:
+    """判断章节是否属于指定父章节。"""
     return title.strip().startswith(f"{parent_prefix}.")
 
 
 def _split_one(block: ParsedBlock, max_chars: int) -> List[ParsedBlock]:
+    """按最大字符数切分单个片段。"""
     content = block.content.strip()
     if len(content) <= max_chars:
         return [block]
@@ -77,21 +78,17 @@ def _split_one(block: ParsedBlock, max_chars: int) -> List[ParsedBlock]:
         text = text.strip()
         if not text:
             continue
-        output.append(ParsedBlock(
-            source_doc=block.source_doc,
+        output.append(replace(
+            block,
             source_section=f"{block.source_section} / 片段 {idx}",
             content=text,
-            pages=block.pages,
             order=block.order * 100 + idx,
-            context=block.context,
-            category=block.category,
-            category_description=block.category_description,
-            category_keywords=block.category_keywords,
         ))
     return output
 
 
 def _split_by_heading_window(text: str, max_chars: int) -> List[str]:
+    """优先按标题窗口切分长文本。"""
     sections = [p.strip() for p in re.split(r"\n(?=#{2,4}\s+)", text) if p.strip()]
     if len(sections) <= 1:
         return _split_by_paragraph_window(text, max_chars)
@@ -119,6 +116,7 @@ def _split_by_heading_window(text: str, max_chars: int) -> List[str]:
 
 
 def _split_by_paragraph_window(text: str, max_chars: int) -> List[str]:
+    """按段落窗口切分长文本。"""
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     chunks: List[str] = []
     current: List[str] = []

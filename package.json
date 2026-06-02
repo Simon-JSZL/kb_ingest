@@ -1,6 +1,6 @@
 {
   "name": "union_kb_ingest",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "description": "Offline knowledge-base ingest helper for PDF, Word, Markdown and TXT documents.",
   "bin": {
     "union_kb_ingest": "bin/union_kb_ingest"

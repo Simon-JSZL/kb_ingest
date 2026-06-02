@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import List
 
@@ -23,6 +24,7 @@ IGNORED_EXISTING_FILES = {".gitkeep", ".DS_Store"}
 
 
 def cmd_parse(args) -> int:
+    """执行解析子命令。"""
     input_path = Path(args.input)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -38,6 +40,7 @@ def cmd_parse(args) -> int:
 
 
 def cmd_draft(args) -> int:
+    """执行草稿生成子命令。"""
     input_path = Path(args.input)
     output_dir = Path(args.output)
 
@@ -52,6 +55,7 @@ def cmd_draft(args) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     total_items = 0
+    source_order = 0
     draft_config = get_draft_config()
     max_chars = args.max_chars or draft_config.max_chars
     files = iter_input_files(input_path)
@@ -65,6 +69,10 @@ def cmd_draft(args) -> int:
         )
         for block in blocks:
             for item in normalize_block(block, status=args.status):
+                source_order += 1
+                item.source_order = source_order
+                item.source_pages = sorted(set(block.pages))
+                item.source_trace = _source_trace(block)
                 write_item(item, output_dir)
                 total_items += 1
         print(f"drafted: {path} blocks={len(blocks)}")
@@ -73,6 +81,7 @@ def cmd_draft(args) -> int:
 
 
 def _list_effective_files(path: Path) -> list[Path]:
+    """列出目录下需要考虑的已有文件。"""
     if not path.exists():
         return []
     return sorted(
@@ -85,6 +94,7 @@ def _confirm_overwrite(
     output_dir: Path,
     existing: list[Path],
 ) -> bool:
+    """询问用户是否覆盖已有生成文件。"""
     print(f"found {len(existing)} existing file(s) in {output_dir}.")
     print("Continuing will delete existing generated files under:")
     print(f"- {output_dir}")
@@ -93,6 +103,7 @@ def _confirm_overwrite(
 
 
 def _clear_generated_files(*dirs: Path) -> None:
+    """删除指定目录下的已有生成文件。"""
     for directory in dirs:
         for path in _list_effective_files(directory):
             path.unlink()
@@ -104,6 +115,7 @@ def _attach_block_context(
     context_chars: int,
     outline_max_sections: int,
 ) -> List[ParsedBlock]:
+    """为片段附加目录和邻近片段上下文。"""
     if context_chars <= 0:
         return blocks
 
@@ -113,11 +125,11 @@ def _attach_block_context(
         parts = []
         if outline:
             parts.append(f"文档章节目录：\n{outline}")
-        if block.category_description:
+        if block.category or block.subcategory or block.category_keywords:
             parts.append(
-                "知识大类说明：\n"
-                f"大类：{block.category}\n"
-                f"说明：{block.category_description}\n"
+                "知识分类：\n"
+                f"大类标题：{block.category}\n"
+                f"小类标题：{block.subcategory}\n"
                 f"关键词：{', '.join(block.category_keywords)}"
             )
         if idx > 0:
@@ -132,21 +144,15 @@ def _attach_block_context(
                 f"章节：{blocks[idx + 1].source_section}\n"
                 f"{_compact_context_text(blocks[idx + 1].content, context_chars // 2)}"
             )
-        output.append(ParsedBlock(
-            source_doc=block.source_doc,
-            source_section=block.source_section,
-            content=block.content,
-            pages=block.pages,
-            order=block.order,
+        output.append(replace(
+            block,
             context="\n\n".join(parts),
-            category=block.category,
-            category_description=block.category_description,
-            category_keywords=block.category_keywords,
         ))
     return output
 
 
 def _document_outline(blocks: List[ParsedBlock], max_sections: int) -> str:
+    """生成文档片段目录摘要。"""
     sections = []
     seen = set()
     for block in blocks:
@@ -164,13 +170,23 @@ def _document_outline(blocks: List[ParsedBlock], max_sections: int) -> str:
 
 
 def _compact_context_text(text: str, limit: int) -> str:
+    """压缩上下文文本到指定长度。"""
     compact = " ".join(text.split())
     if limit <= 0 or len(compact) <= limit:
         return compact
     return compact[:limit].rstrip() + "..."
 
 
+def _source_trace(block: ParsedBlock) -> str:
+    """生成来源章节和页码追踪信息。"""
+    parts = [f"section={block.source_section}"]
+    if block.pages:
+        parts.append(f"pages={','.join(map(str, sorted(set(block.pages))))}")
+    return "; ".join(parts)
+
+
 def cmd_validate(args) -> int:
+    """执行校验子命令。"""
     issues = validate_dir(Path(args.input))
     for issue in issues:
         print(f"{issue.level}: {issue.path}: {issue.message}")
@@ -179,6 +195,7 @@ def cmd_validate(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(description="Offline document-to-knowledge Markdown generator.")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -202,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """命令行入口。"""
     parser = build_parser()
     args = parser.parse_args()
     return args.func(args)
