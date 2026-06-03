@@ -19,6 +19,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 KB_SPEC_PATH = CURRENT_DIR / "prompts" / "知识库建立规范.md"
 TOOLS_PATH = CURRENT_DIR / "input" / "function" / "tools.json"
 LLM_MAX_RETRIES = 10
+COVERAGE_MAX_RETRIES = 3
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
     client = client_cls(api_key=config.api_key, base_url=config.base_url)
 
     compact_retry = False
+    coverage_retry_count = 0
     coverage_retry_feedback = ""
     json_retry_feedback = ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
@@ -150,14 +152,29 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
         if items:
             coverage_issues = _source_fact_coverage_issues(block, items)
             if coverage_issues:
+                high_relevance_issues = _high_relevance_coverage_issues(
+                    client, config, block, items, coverage_issues
+                )
+                if not high_relevance_issues:
+                    print(
+                        "llm coverage warning ignored: "
+                        "no highly relevant missing facts after relevance review"
+                    )
+                    return items
                 print(
                     "llm coverage failed: "
                     f"missing_facts={len(coverage_issues)} "
-                    f"preview={_preview('；'.join(coverage_issues[:3]))}"
+                    f"high_relevance_missing_facts={len(high_relevance_issues)} "
+                    f"preview={_preview('；'.join(high_relevance_issues[:3]))}"
                 )
-                if attempt >= LLM_MAX_RETRIES:
-                    _abort_llm("source fact coverage failed after 10 attempts", block)
-                coverage_retry_feedback = _coverage_retry_prompt(coverage_issues)
+                if coverage_retry_count >= COVERAGE_MAX_RETRIES or attempt >= LLM_MAX_RETRIES:
+                    print(
+                        "WARNING: source fact coverage failed after "
+                        f"{coverage_retry_count} coverage retries; releasing draft for manual review"
+                    )
+                    return _items_with_coverage_warning(items, block, high_relevance_issues)
+                coverage_retry_count += 1
+                coverage_retry_feedback = _coverage_retry_prompt(block, high_relevance_issues, items)
                 time.sleep(min(2 ** (attempt - 1), 30))
                 continue
             return items
@@ -195,14 +212,192 @@ def _compact_retry_prompt(base_prompt: str) -> str:
     )
 
 
-def _coverage_retry_prompt(missing_facts: List[str]) -> str:
+def _high_relevance_coverage_issues(
+    client,
+    config,
+    block: ParsedBlock,
+    items: List[KnowledgeItem],
+    missing_facts: List[str],
+) -> List[str]:
+    """让 LLM 判断缺失事实是否与当前条目高度相关。"""
+    if not missing_facts:
+        return []
+    prompt = _coverage_relevance_prompt(block, items, missing_facts)
+    try:
+        response = _create_zhipu_completion(client, config, prompt)
+        content = _extract_response_content(response)
+        parsed = _extract_json_with_diagnostics(content).value
+        high_relevance = _high_relevance_facts_from_analysis(parsed, missing_facts)
+        if high_relevance is not None:
+            print(
+                "llm coverage relevance: "
+                f"missing_facts={len(missing_facts)} high_relevance={len(high_relevance)}"
+            )
+            return high_relevance
+    except Exception as exc:
+        print(f"llm coverage relevance failed: {type(exc).__name__} detail={exc}")
+
+    fallback = _fallback_high_relevance_coverage_issues(block, items, missing_facts)
+    print(
+        "llm coverage relevance fallback: "
+        f"missing_facts={len(missing_facts)} high_relevance={len(fallback)}"
+    )
+    return fallback
+
+
+def _coverage_relevance_prompt(
+    block: ParsedBlock,
+    items: List[KnowledgeItem],
+    missing_facts: List[str],
+) -> str:
+    """构造缺失事实相关性判定提示。"""
+    fact_lines = "\n".join(f"- {fact}" for fact in missing_facts[:20])
+    current_items = "\n\n".join(
+        f"标题：{item.title}\n核心正文：{_core_sections_for_coverage(item.body)}"
+        for item in items
+    )
+    return f"""
+请判断以下“覆盖校验缺失事实”是否与当前知识条目的主题极高相关。
+
+判定规则：
+1. 只有缺失事实是回答当前条目标题或核心正文所必须保留的定义、规则、阈值、条件、主体、简称、例外或限制时，才标记为“极高”。
+2. 来源文件标题、章节标题、目录项、上级主题名称、页眉页脚、纯标签、仅用于定位的小标题，通常不是“极高”，除非它本身就是当前条目要解释的完整定义或规则。
+3. 辅助上下文只用于理解位置和主题，不要把辅助上下文中独有的信息作为缺失事实依据。
+4. 只能返回 JSON object，不要 Markdown 或解释文字。
+
+返回格式：
+{{
+  "facts": [
+    {{"fact": "必须原样复制待判断事实", "relevance": "极高|一般|低", "reason": "一句话原因"}}
+  ]
+}}
+
+来源文档：{block.source_doc}
+来源章节：{block.source_section or "全文"}
+
+当前来源原文片段：
+{_preview(block.content)[:4000] or "无"}
+
+辅助上下文：
+{_preview(block.context)[:2000] or "无"}
+
+当前已生成条目：
+{_preview(current_items)[:4000] or "无"}
+
+待判断事实：
+{fact_lines}
+""".strip()
+
+
+def _high_relevance_facts_from_analysis(parsed, missing_facts: List[str]):
+    """从相关性判定 JSON 中提取极高相关事实。"""
+    if not isinstance(parsed, dict):
+        return None
+    raw_facts = parsed.get("facts")
+    if raw_facts is None and isinstance(parsed.get("results"), list):
+        raw_facts = parsed.get("results")
+    if raw_facts is None and isinstance(parsed.get("items"), list):
+        raw_facts = parsed.get("items")
+    if not isinstance(raw_facts, list):
+        return None
+
+    missing_by_norm = {_coverage_text(fact): fact for fact in missing_facts}
+    selected: List[str] = []
+    for raw in raw_facts:
+        if not isinstance(raw, dict):
+            continue
+        relevance = str(raw.get("relevance") or raw.get("关联度") or "").strip().lower()
+        if not ("极高" in relevance or "high" in relevance):
+            continue
+        fact = str(raw.get("fact") or raw.get("事实") or raw.get("text") or "").strip()
+        matched = _match_missing_fact(fact, missing_by_norm)
+        if matched and matched not in selected:
+            selected.append(matched)
+    return selected
+
+
+def _match_missing_fact(fact: str, missing_by_norm: Dict[str, str]) -> str:
+    """把模型返回事实匹配回原始缺失事实。"""
+    fact_norm = _coverage_text(fact)
+    if not fact_norm:
+        return ""
+    if fact_norm in missing_by_norm:
+        return missing_by_norm[fact_norm]
+    for missing_norm, missing in missing_by_norm.items():
+        if fact_norm in missing_norm or missing_norm in fact_norm:
+            return missing
+    return ""
+
+
+def _fallback_high_relevance_coverage_issues(
+    block: ParsedBlock,
+    items: List[KnowledgeItem],
+    missing_facts: List[str],
+) -> List[str]:
+    """相关性判定失败时的保守兜底，过滤明显结构性标题。"""
+    return [
+        fact for fact in missing_facts
+        if not _looks_like_structural_missing_fact(block, items, fact)
+    ]
+
+
+def _looks_like_structural_missing_fact(
+    block: ParsedBlock,
+    items: List[KnowledgeItem],
+    fact: str,
+) -> bool:
+    """判断缺失事实是否只是标题、章节或定位信息。"""
+    fact_norm = _coverage_text(fact)
+    if not fact_norm:
+        return True
+    candidates = [
+        block.source_doc,
+        Path(block.source_doc).stem,
+        block.source_section,
+        block.category,
+        block.subcategory,
+        block.source_doc_description,
+        block.subcategory_description,
+        *block.category_path,
+        *block.related_categories,
+        *(item.title for item in items),
+    ]
+    candidate_norms = {_coverage_text(value) for value in candidates if value}
+    if fact_norm in candidate_norms:
+        return True
+    if len(fact_norm) <= 30 and not re.search(
+        r"是|为|指|称|简称|英文|应|需|必须|不得|禁止|超过|低于|大于|小于|不少于|不超过|\d",
+        fact,
+    ):
+        return True
+    return False
+
+
+def _coverage_retry_prompt(
+    block: ParsedBlock,
+    missing_facts: List[str],
+    items: List[KnowledgeItem],
+) -> str:
     """构造事实覆盖不足时的重试提示。"""
     lines = "\n".join(f"- {fact}" for fact in missing_facts[:8])
+    source_excerpt = _preview(block.content)[:4000] or "无"
+    context_excerpt = _preview(block.context)[:2000] or "无"
+    current_core = _preview(
+        "\n\n".join(_core_sections_for_coverage(item.body) for item in items)
+    )[:3000] or "无"
     return (
         "重试补充要求：上一次输出遗漏了以下来源正文事实。"
         "请重新生成 JSON，并把这些事实写入 ## 1. 核心内容、## 2. 适用边界 或 ## 3. 使用要求。"
         "短定义句、简称句、阈值句和规则句应优先保留原句或等价完整表述，不要只概括关键词。\n"
-        f"{lines}"
+        f"{lines}\n\n"
+        f"来源文档：{block.source_doc}\n"
+        f"来源章节：{block.source_section or '全文'}\n\n"
+        "当前来源原文片段如下，请结合上下文判断缺失事实应补入哪个正文小节：\n"
+        f"{source_excerpt}\n\n"
+        "辅助上下文如下。辅助上下文只用于理解位置和术语，不要把其中独有事实写入正文：\n"
+        f"{context_excerpt}\n\n"
+        "上一轮生成的核心正文如下，请在此基础上补齐遗漏事实并保持 JSON 根结构不变：\n"
+        f"{current_core}"
     )
 
 
@@ -397,7 +592,7 @@ def _build_prompt(block: ParsedBlock, status: str) -> str:
 要求：
 1. 严格参照《知识库建立规范》的元数据字段、正文 5 节结构、内容切分原则和质量校验要求生成。
 2. 只依据原文理解知识点、对象、模块、角色、标签和风险等级，不要依据示例或常见关键词进行套写。
-3. 如果一个片段包含多个独立定义、规则、流程、指标、接口或评价标准，请拆成多个 items。
+3. 如果一个片段包含多个独立定义、规则、流程、指标、接口或判定标准，请拆成多个 items。
 4. 每个 item 必须可独立检索、独立回答，颗粒度控制在 800 到 1500 中文字符左右；复杂表格可适当放宽。
 5. 不要编造来源、阈值、角色、日期、版本；原文没有的信息留空、空数组或使用规范允许的通用值。
 6. 涉及表格、阈值、比较符、单位、持续时间、笔数、适用对象时必须保留原始逻辑。
@@ -426,7 +621,7 @@ doc_type 只能取：
   "items": [
     {{
       "title": "",
-      "doc_type": "scenario",
+      "doc_type": "biz",
       "category": "",
       "subcategory": "",
       "related_items": [],
@@ -717,6 +912,42 @@ def _normalize_heuristically(block: ParsedBlock, status: str) -> KnowledgeItem:
         relation_notes=block.relation_notes,
         related_items=block.related_items,
     )
+
+
+def _items_with_coverage_warning(
+    items: List[KnowledgeItem],
+    block: ParsedBlock,
+    missing_facts: List[str],
+) -> List[KnowledgeItem]:
+    """把覆盖不足的 LLM 结果降级为需人工复核的草稿。"""
+    for item in items:
+        item.status = "draft"
+        item.review_status = "coverage_warning"
+        if "需人工复核" not in item.tags:
+            item.tags.append("需人工复核")
+        item.body = _body_with_coverage_warning(item.body, block, missing_facts)
+    return items
+
+
+def _body_with_coverage_warning(
+    body: str,
+    block: ParsedBlock,
+    missing_facts: List[str],
+) -> str:
+    """在正文核心章节标注覆盖不足的来源事实。"""
+    fact_lines = "\n".join(f"> - {fact}" for fact in missing_facts[:20])
+    note = (
+        "\n\n"
+        "> WARNING: LLM 多次重试后仍未通过来源事实覆盖校验，本条目已降为草稿，需人工复核。\n"
+        f"> 来源文档：{block.source_doc}\n"
+        f"> 来源章节：{block.source_section or '全文'}\n"
+        "> 待人工补齐或确认的来源事实：\n"
+        f"{fact_lines}"
+    )
+    pattern = r"(^##\s+1\.\s+核心内容\s*$)"
+    if re.search(pattern, body, flags=re.M):
+        return re.sub(pattern, r"\1" + note, body, count=1, flags=re.M)
+    return f"{body.rstrip()}\n\n## 人工复核提示{note}"
 
 
 def _source_fact_coverage_issues(block: ParsedBlock, items: List[KnowledgeItem]) -> List[str]:

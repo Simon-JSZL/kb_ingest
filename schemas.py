@@ -7,13 +7,7 @@ from typing import Dict, List
 
 DOC_TYPES = {
     "biz",
-    "scenario",
-    "sop",
-    "metric",
-    "severity",
-    "change",
     "function",
-    "evaluation",
 }
 
 
@@ -104,6 +98,7 @@ class KnowledgeItem:
             "applicable_roles": self.applicable_roles,
             "tags": self.tags,
             "status": self.status,
+            "review_status": self.review_status,
         }
 
 

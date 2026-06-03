@@ -6,8 +6,12 @@ from pathlib import Path
 
 from normalizer import (
     _build_prompt,
+    _coverage_retry_prompt,
     _extract_json_with_diagnostics,
+    _fallback_high_relevance_coverage_issues,
+    _high_relevance_facts_from_analysis,
     _item_from_dict,
+    _items_with_coverage_warning,
     _json_repair_retry_prompt,
     _postprocess_item,
     _significant_token_overlap,
@@ -229,6 +233,164 @@ class NormalizerPostprocessTest(unittest.TestCase):
         )
 
         self.assertEqual(_source_fact_coverage_issues(block, [item]), [])
+
+    def test_coverage_retry_prompt_includes_source_context_and_previous_body(self):
+        block = ParsedBlock(
+            source_doc="制度.md",
+            source_section="4.1 运行监控",
+            content="当前片段要求监控异常交易笔数超过 30000 笔时升级处理。",
+            context="上一节说明监控对象为大型单位。",
+        )
+        item = KnowledgeItem(
+            kb_id="biz-test-v1",
+            title="异常交易监控",
+            doc_type="biz",
+            domain="联合运维",
+            category="分类",
+            category_keywords=[],
+            business_modules=[],
+            source_doc=block.source_doc,
+            source_version="",
+            source_section=block.source_section,
+            effective_date="",
+            owner="",
+            confidentiality="内部",
+            risk_level="low",
+            applicable_roles=[],
+            tags=[],
+            status="active",
+            body="""# 异常交易监控
+
+## 1. 核心内容
+
+监控异常交易。
+
+## 2. 适用边界
+
+原文未明确说明。
+
+## 3. 使用要求
+
+原文未明确说明。
+""",
+        )
+
+        prompt = _coverage_retry_prompt(block, ["异常交易笔数超过 30000 笔时升级处理。"], [item])
+
+        self.assertIn("来源文档：制度.md", prompt)
+        self.assertIn("来源章节：4.1 运行监控", prompt)
+        self.assertIn("当前来源原文片段", prompt)
+        self.assertIn("当前片段要求监控异常交易笔数超过 30000 笔时升级处理。", prompt)
+        self.assertIn("上一节说明监控对象为大型单位。", prompt)
+        self.assertIn("上一轮生成的核心正文", prompt)
+        self.assertIn("监控异常交易。", prompt)
+
+    def test_coverage_warning_releases_draft_with_manual_review_marker(self):
+        block = ParsedBlock(
+            source_doc="制度.md",
+            source_section="4.1 运行监控",
+            content="当前片段要求监控异常交易笔数超过 30000 笔时升级处理。",
+        )
+        item = KnowledgeItem(
+            kb_id="biz-test-v1",
+            title="异常交易监控",
+            doc_type="biz",
+            domain="联合运维",
+            category="分类",
+            category_keywords=[],
+            business_modules=[],
+            source_doc=block.source_doc,
+            source_version="",
+            source_section=block.source_section,
+            effective_date="",
+            owner="",
+            confidentiality="内部",
+            risk_level="low",
+            applicable_roles=[],
+            tags=[],
+            status="active",
+            body="""# 异常交易监控
+
+## 1. 核心内容
+
+监控异常交易。
+
+## 2. 适用边界
+
+原文未明确说明。
+
+## 3. 使用要求
+
+原文未明确说明。
+""",
+        )
+
+        released = _items_with_coverage_warning(item_list := [item], block, ["异常交易笔数超过 30000 笔时升级处理。"])
+
+        self.assertIs(released, item_list)
+        self.assertEqual(item.status, "draft")
+        self.assertEqual(item.review_status, "coverage_warning")
+        self.assertIn("需人工复核", item.tags)
+        self.assertIn("WARNING: LLM 多次重试后仍未通过来源事实覆盖校验", item.body)
+        self.assertIn("异常交易笔数超过 30000 笔时升级处理。", item.body)
+
+    def test_relevance_analysis_keeps_only_high_relevance_missing_facts(self):
+        missing = [
+            "运行监控",
+            "异常交易笔数超过 30000 笔时升级处理。",
+        ]
+        parsed = {
+            "facts": [
+                {"fact": "运行监控", "relevance": "低", "reason": "章节标题"},
+                {
+                    "fact": "异常交易笔数超过 30000 笔时升级处理。",
+                    "relevance": "极高",
+                    "reason": "阈值规则",
+                },
+            ]
+        }
+
+        self.assertEqual(
+            _high_relevance_facts_from_analysis(parsed, missing),
+            ["异常交易笔数超过 30000 笔时升级处理。"],
+        )
+
+    def test_relevance_fallback_filters_structural_title_missing_fact(self):
+        block = ParsedBlock(
+            source_doc="制度.md",
+            source_section="4.1 运行监控",
+            content="运行监控\n\n异常交易笔数超过 30000 笔时升级处理。",
+            subcategory="运行监控",
+        )
+        item = KnowledgeItem(
+            kb_id="biz-test-v1",
+            title="异常交易监控",
+            doc_type="biz",
+            domain="联合运维",
+            category="分类",
+            category_keywords=[],
+            business_modules=[],
+            source_doc=block.source_doc,
+            source_version="",
+            source_section=block.source_section,
+            effective_date="",
+            owner="",
+            confidentiality="内部",
+            risk_level="low",
+            applicable_roles=[],
+            tags=[],
+            status="active",
+            body="# 异常交易监控\n\n## 1. 核心内容\n\n监控异常交易。",
+        )
+
+        self.assertEqual(
+            _fallback_high_relevance_coverage_issues(
+                block,
+                [item],
+                ["运行监控", "异常交易笔数超过 30000 笔时升级处理。"],
+            ),
+            ["异常交易笔数超过 30000 笔时升级处理。"],
+        )
 
     def test_rewrites_hallucinated_function_when_source_is_unrelated(self):
         block = ParsedBlock(
