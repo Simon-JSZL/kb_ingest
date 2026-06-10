@@ -9,6 +9,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
 
+import yaml
+
 from app_config import get_llm_config
 from schemas import DOC_TYPES, KnowledgeItem, ParsedBlock
 
@@ -17,7 +19,7 @@ DEFAULT_DOMAIN = "网联清算业务"
 DEFAULT_OWNER = "网联清算业务知识库"
 CURRENT_DIR = Path(__file__).resolve().parent
 KB_SPEC_PATH = CURRENT_DIR / "prompts" / "知识库建立规范.md"
-TOOLS_PATH = CURRENT_DIR / "input" / "function" / "tools.json"
+TOOLS_PATH = CURRENT_DIR / "input" / "function" / "tools.yaml"
 LLM_MAX_RETRIES = 10
 COVERAGE_MAX_RETRIES = 3
 
@@ -453,22 +455,76 @@ def _get_zhipu_client_class():
 
 def _extract_response_content(response) -> str:
     """从模型响应中提取正文内容。"""
-    if isinstance(response, dict):
-        choices = response.get("choices") or []
-        if not choices:
-            return ""
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
-        return str((message or {}).get("content") or "")
-
-    choices = getattr(response, "choices", None) or []
-    if not choices:
+    message = _first_message(response)
+    if message is None:
         return ""
-    message = getattr(choices[0], "message", None)
-    if message is None and isinstance(choices[0], dict):
-        message = choices[0].get("message")
+
     if isinstance(message, dict):
-        return str(message.get("content") or "")
-    return str(getattr(message, "content", "") or "")
+        content = _stringify_message_content(message.get("content"))
+        if content:
+            return content
+        content = _extract_tool_call_content(message.get("function_call"))
+        if content:
+            return content
+        content = _extract_tool_call_content(message.get("tool_calls"))
+        if content:
+            return content
+        return _stringify_message_content(message.get("reasoning_content"))
+
+    content = _stringify_message_content(getattr(message, "content", ""))
+    if content:
+        return content
+    content = _extract_tool_call_content(getattr(message, "function_call", None))
+    if content:
+        return content
+    content = _extract_tool_call_content(getattr(message, "tool_calls", None))
+    if content:
+        return content
+    return _stringify_message_content(getattr(message, "reasoning_content", ""))
+
+
+def _stringify_message_content(content) -> str:
+    """兼容不同 SDK 返回的纯文本、分段文本和结构化 content。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [_stringify_message_content(part) for part in content]
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        for key in ("text", "content", "output_text", "json", "arguments"):
+            value = content.get(key)
+            text = _stringify_message_content(value)
+            if text:
+                return text
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except TypeError:
+            return str(content)
+
+    for attr in ("text", "content", "output_text"):
+        value = getattr(content, attr, None)
+        text = _stringify_message_content(value)
+        if text:
+            return text
+    return str(content)
+
+
+def _extract_tool_call_content(tool_calls) -> str:
+    """从工具/函数调用参数里兜底提取 JSON 文本。"""
+    if not tool_calls:
+        return ""
+    calls = tool_calls if isinstance(tool_calls, list) else [tool_calls]
+    for call in calls:
+        function = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+        if function is None:
+            function = call
+        arguments = function.get("arguments") if isinstance(function, dict) else getattr(function, "arguments", None)
+        text = _stringify_message_content(arguments)
+        if text:
+            return text
+    return ""
 
 
 def _extract_reasoning_content(response) -> str:
@@ -525,7 +581,19 @@ def _coerce_raw_items(parsed):
         if isinstance(items, list):
             return items
 
-        for key in ("knowledge_items", "records", "data", "result", "results"):
+        for key in (
+            "knowledge_items",
+            "records",
+            "data",
+            "payload",
+            "output",
+            "response",
+            "answer",
+            "content",
+            "message",
+            "result",
+            "results",
+        ):
             value = parsed.get(key)
             if isinstance(value, list):
                 print(f"llm parse notice: using non-standard list field '{key}' as items")
@@ -535,6 +603,13 @@ def _coerce_raw_items(parsed):
                 if isinstance(nested, list):
                     print(f"llm parse notice: using nested field '{key}' as items")
                     return nested
+            if isinstance(value, str) and value.strip():
+                nested = _extract_json_with_diagnostics(value)
+                if nested.value is not None:
+                    nested_items = _coerce_raw_items(nested.value)
+                    if isinstance(nested_items, list):
+                        print(f"llm parse notice: parsed JSON string field '{key}' as items")
+                        return nested_items
 
         if _looks_like_single_item(parsed):
             print("llm parse notice: wrapping single item object as items[0]")
@@ -670,9 +745,11 @@ def _read_kb_spec() -> str:
 def _read_tools() -> List[Dict[str, Any]]:
     """读取本地工具维护文件。"""
     try:
-        raw = json.loads(TOOLS_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        raw = yaml.safe_load(TOOLS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, yaml.YAMLError):
         return []
+    if isinstance(raw, dict):
+        raw = raw.get("tools")
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, dict)]

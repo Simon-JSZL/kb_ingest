@@ -3,10 +3,14 @@ from __future__ import annotations
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from unittest.mock import patch
 
+import normalizer
 from normalizer import (
     _build_prompt,
+    _coerce_raw_items,
     _coverage_retry_prompt,
+    _extract_response_content,
     _extract_json_with_diagnostics,
     _fallback_high_relevance_coverage_issues,
     _high_relevance_facts_from_analysis,
@@ -14,11 +18,93 @@ from normalizer import (
     _items_with_coverage_warning,
     _json_repair_retry_prompt,
     _postprocess_item,
+    _read_tools,
     _significant_token_overlap,
     _source_fact_coverage_issues,
 )
 from schemas import KnowledgeItem, ParsedBlock
 from writer import write_item
+
+
+class LlmResponseCompatibilityTest(unittest.TestCase):
+    def test_reads_tools_yaml_top_level_tools(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tools.yaml"
+            path.write_text(
+                """
+tools:
+  - name: unit_uops_api_status
+    display_name: 互联互通API接口情况查询
+    input_schema:
+      type: object
+""".strip(),
+                encoding="utf-8",
+            )
+            _read_tools.cache_clear()
+            try:
+                with patch.object(normalizer, "TOOLS_PATH", path):
+                    self.assertEqual(_read_tools()[0]["name"], "unit_uops_api_status")
+            finally:
+                _read_tools.cache_clear()
+
+    def test_extracts_segmented_message_content(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": '{"items": ['},
+                            {"type": "text", "text": '{"title": "规则"}]}'},
+                        ]
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(_extract_response_content(response), '{"items": [\n{"title": "规则"}]}')
+
+    def test_extracts_object_message_content(self):
+        class ContentPart:
+            text = '{"items": [{"title": "对象响应"}]}'
+
+        class Message:
+            content = [ContentPart()]
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+
+        self.assertEqual(_extract_response_content(Response()), '{"items": [{"title": "对象响应"}]}')
+
+    def test_extracts_tool_call_arguments_when_content_is_empty(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "arguments": '{"items": [{"title": "工具调用"}]}'
+                                }
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(_extract_response_content(response), '{"items": [{"title": "工具调用"}]}')
+
+    def test_coerces_gateway_wrapped_json_string_items(self):
+        parsed = {
+            "code": 0,
+            "payload": '{"items": [{"title": "网关包装", "body": "正文"}]}',
+        }
+
+        self.assertEqual(_coerce_raw_items(parsed), [{"title": "网关包装", "body": "正文"}])
 
 
 class NormalizerPostprocessTest(unittest.TestCase):
@@ -435,23 +521,23 @@ display_name: "互联互通API接口情况查询"
         self.assertIn("知识分类：", processed.body)
         self.assertIn("大类标题：异常处置规范", processed.body)
 
-    def test_writes_matched_function_as_yaml_fence(self):
+    def test_writes_matched_tool_from_tools_yaml_as_yaml_fence(self):
         block = ParsedBlock(
-            source_doc="互联互通.md",
-            source_section="API接口查询",
-            content="用户可查询自身接入联合运维互联互通API的具体情况，以及某一场景是否接入。",
-            category="互联互通技术规范",
-            category_description="覆盖API接入状态查询。",
-            category_keywords=["互联互通", "API接入"],
+            source_doc="变更通知.md",
+            source_section="成员机构变更报备查询",
+            content="用户可查询某家机构近期变更、变更报备、计划变更、执行评价以及影响范围。",
+            category="成员机构变更管理",
+            category_description="覆盖成员机构变更通知查询。",
+            category_keywords=["成员机构", "变更通知"],
         )
         item = _item_from_dict(
             {
-                "title": "互联互通API接入查询",
-                "body": """# 互联互通API接入查询
+                "title": "成员机构变更通知查询",
+                "body": """# 成员机构变更通知查询
 
 ## 1. 核心内容
 
-适用于查询互联互通API接入状态。
+适用于查询成员机构近期变更、变更报备和执行评价。
 
 ## 4. 关联能力
 
@@ -469,10 +555,10 @@ display_name: "互联互通API接口情况查询"
 
         processed = _postprocess_item(item, block)
 
-        self.assertIn("```yaml\nfunction_name: \"unit_uops_api_status\"", processed.body)
-        self.assertIn('display_name: "互联互通API接口情况查询"', processed.body)
+        self.assertIn("```yaml\nfunction_name: \"query_member_change_announcements\"", processed.body)
+        self.assertIn('display_name: "查询成员机构变更通知"', processed.body)
         self.assertIn("required_permissions: []", processed.body)
-        self.assertIn('org_code: "成员单位金融编码，例如C10010010010"', processed.body)
+        self.assertIn('orgCode: "成员机构金融编码，通常由 resolve_member_org 工具获得。"', processed.body)
         self.assertIn("```", processed.body)
 
     def test_does_not_match_tool_from_broad_category_words_only(self):
@@ -574,7 +660,7 @@ display_name: "互联互通API接口情况查询"
         self.assertEqual(processed.source_pages, [3, 4])
         self.assertEqual(processed.source_order, 7)
 
-    def test_write_item_prefixes_filename_with_source_order(self):
+    def test_write_item_prefixes_filename_with_source_title_timestamp_and_trace_id(self):
         item = KnowledgeItem(
             kb_id="biz-offline-abc-v1",
             title="标题",
@@ -600,9 +686,18 @@ display_name: "互联互通API接口情况查询"
         )
 
         with TemporaryDirectory() as tmp:
-            path = write_item(item, Path(tmp))
+            path = write_item(
+                item,
+                Path(tmp),
+                source_title="制度",
+                timestamp="20260610153045",
+                trace_id="a1b2c3d4",
+            )
 
-        self.assertEqual(path.name, "000012-biz-offline-abc-v1.md")
+        self.assertEqual(
+            path.name,
+            "制度-20260610153045-a1b2c3d4-000012-biz-offline-abc-v1.md",
+        )
 
 
 if __name__ == "__main__":

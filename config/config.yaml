@@ -3,7 +3,7 @@ llm:
   timeout_seconds: 120
   max_tokens: 8192
   temperature: 0.1
-  api_key: "15f066c4509845038027ea5746524af5.w4CLSC6ODiKVC1wK"
+  api_key: ""
   model: "GLM-4.7-Flash"
   base_url: "https://open.bigmodel.cn/api/paas/v4/"
 

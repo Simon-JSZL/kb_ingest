@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import List
+from uuid import uuid4
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -21,6 +24,7 @@ from writer import write_item
 
 
 IGNORED_EXISTING_FILES = {".gitkeep", ".DS_Store"}
+PROGRESS_FILENAME = ".draft_progress.json"
 
 
 def cmd_parse(args) -> int:
@@ -45,21 +49,44 @@ def cmd_draft(args) -> int:
     output_dir = Path(args.output)
 
     existing = _list_effective_files(output_dir)
-    if existing and not _confirm_overwrite(output_dir, existing):
-        print("aborted. existing files were kept.")
-        return 0
-
+    progress_path = output_dir / PROGRESS_FILENAME
+    resume_state = None
     if existing:
-        _clear_generated_files(output_dir)
+        action = _choose_existing_result_action(output_dir, existing)
+        if action == "exit":
+            print("aborted. existing files were kept.")
+            return 0
+        if action == "rebuild":
+            _clear_generated_files(output_dir)
+        elif action == "resume":
+            resume_state = _load_progress(progress_path)
+            if not resume_state:
+                print(f"aborted. no usable checkpoint found at {progress_path}.")
+                return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    total_items = 0
-    source_order = 0
+    run_timestamp = (
+        str(resume_state.get("run_timestamp"))
+        if resume_state
+        else _make_timestamp()
+    )
+    run_trace_id = (
+        str(resume_state.get("run_trace_id"))
+        if resume_state
+        else uuid4().hex[:8]
+    )
+    total_items = int(resume_state.get("total_items", 0)) if resume_state else 0
+    source_order = int(resume_state.get("source_order", 0)) if resume_state else 0
     draft_config = get_draft_config()
     max_chars = args.max_chars or draft_config.max_chars
     files = iter_input_files(input_path)
-    for path in files:
+    start_file_index = int(resume_state.get("file_index", 0)) if resume_state else 0
+    start_block_index = int(resume_state.get("block_index", 0)) if resume_state else 0
+
+    for file_index, path in enumerate(files):
+        if file_index < start_file_index:
+            continue
         parsed = parse_document(path)
         blocks = split_blocks(parsed.blocks, max_chars=max_chars)
         blocks = _attach_block_context(
@@ -67,15 +94,76 @@ def cmd_draft(args) -> int:
             context_chars=draft_config.context_chars,
             outline_max_sections=draft_config.outline_max_sections,
         )
-        for block in blocks:
-            for item in normalize_block(block, status=args.status):
+        block_start = start_block_index if file_index == start_file_index else 0
+        for block_index, block in enumerate(blocks):
+            if block_index < block_start:
+                continue
+            _save_progress(
+                progress_path,
+                input_path=input_path,
+                output_dir=output_dir,
+                files=files,
+                run_timestamp=run_timestamp,
+                run_trace_id=run_trace_id,
+                source_order=source_order,
+                total_items=total_items,
+                file_index=file_index,
+                block_index=block_index,
+                status="running",
+            )
+            try:
+                items = normalize_block(block, status=args.status)
+            except SystemExit as exc:
+                _save_progress(
+                    progress_path,
+                    input_path=input_path,
+                    output_dir=output_dir,
+                    files=files,
+                    run_timestamp=run_timestamp,
+                    run_trace_id=run_trace_id,
+                    source_order=source_order,
+                    total_items=total_items,
+                    file_index=file_index,
+                    block_index=block_index,
+                    status="failed",
+                    error=f"SystemExit({exc.code})",
+                )
+                print(
+                    "checkpoint saved. "
+                    f"file={path.name} block={block_index + 1}/{len(blocks)} "
+                    f"progress={progress_path}"
+                )
+                raise
+            for item in items:
                 source_order += 1
                 item.source_order = source_order
                 item.source_pages = sorted(set(block.pages))
                 item.source_trace = _source_trace(block)
-                write_item(item, output_dir)
+                write_item(
+                    item,
+                    output_dir,
+                    source_title=Path(block.source_doc).stem,
+                    timestamp=run_timestamp,
+                    trace_id=run_trace_id,
+                )
                 total_items += 1
+            _save_progress(
+                progress_path,
+                input_path=input_path,
+                output_dir=output_dir,
+                files=files,
+                run_timestamp=run_timestamp,
+                run_trace_id=run_trace_id,
+                source_order=source_order,
+                total_items=total_items,
+                file_index=file_index,
+                block_index=block_index + 1,
+                status="running",
+            )
         print(f"drafted: {path} blocks={len(blocks)}")
+        start_block_index = 0
+    if progress_path.exists():
+        progress_path.unlink()
     print(f"done. files={len(files)} draft_items={total_items} output={output_dir}")
     return 0
 
@@ -90,16 +178,81 @@ def _list_effective_files(path: Path) -> list[Path]:
     )
 
 
-def _confirm_overwrite(
-    output_dir: Path,
-    existing: list[Path],
-) -> bool:
-    """询问用户是否覆盖已有生成文件。"""
+def _choose_existing_result_action(output_dir: Path, existing: list[Path]) -> str:
+    """询问用户如何处理已有生成结果。"""
     print(f"found {len(existing)} existing file(s) in {output_dir}.")
-    print("Continuing will delete existing generated files under:")
-    print(f"- {output_dir}")
-    answer = input("Overwrite and continue? [y/N]: ").strip().lower()
-    return answer in {"y", "yes"}
+    print("Choose how to continue:")
+    print("1. delete and rebuild")
+    print("2. resume from checkpoint")
+    print("3. exit")
+    answer = input("Select [1/2/3]: ").strip().lower().translate(
+        str.maketrans({"１": "1", "２": "2", "３": "3"})
+    )
+    if answer.startswith("1") or answer in {"d", "delete", "rebuild", "r"}:
+        return "rebuild"
+    if answer.startswith("2") or answer in {"resume", "continue", "c"}:
+        return "resume"
+    return "exit"
+
+
+def _load_progress(path: Path) -> dict | None:
+    """读取断点续传状态。"""
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"WARNING: failed to read checkpoint: {exc}")
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _save_progress(
+    path: Path,
+    *,
+    input_path: Path,
+    output_dir: Path,
+    files: list[Path],
+    run_timestamp: str,
+    run_trace_id: str,
+    source_order: int,
+    total_items: int,
+    file_index: int,
+    block_index: int,
+    status: str,
+    error: str = "",
+) -> None:
+    """保存 draft 断点续传状态。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current_file = files[file_index] if 0 <= file_index < len(files) else None
+    payload = {
+        "version": 1,
+        "status": status,
+        "error": error,
+        "input_path": str(input_path),
+        "output_dir": str(output_dir),
+        "run_timestamp": run_timestamp,
+        "run_trace_id": run_trace_id,
+        "source_order": source_order,
+        "total_items": total_items,
+        "file_index": file_index,
+        "block_index": block_index,
+        "current_file": str(current_file) if current_file else "",
+        "current_file_name": current_file.name if current_file else "",
+        "files": [str(path) for path in files],
+        "updated_at": _make_timestamp(),
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _make_timestamp() -> str:
+    """生成用于文件名和断点记录的本地时间戳。"""
+    return datetime.now().strftime("%Y%m%d%H%M%S")
 
 
 def _clear_generated_files(*dirs: Path) -> None:

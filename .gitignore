@@ -3,10 +3,11 @@ parsed/*
 drafts/*
 approved/*
 rejected/*
+result/*
 !input/.gitkeep
 !input/pdf/.gitkeep
 !input/word/.gitkeep
 !parsed/.gitkeep
 !drafts/.gitkeep
 !approved/.gitkeep
-
+PROJECT_OVERVIEW.md

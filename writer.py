@@ -8,10 +8,25 @@ import yaml
 from schemas import KnowledgeItem
 
 
-def write_item(item: KnowledgeItem, output_dir: Path) -> Path:
+def write_item(
+    item: KnowledgeItem,
+    output_dir: Path,
+    *,
+    source_title: str | None = None,
+    timestamp: str | None = None,
+    trace_id: str | None = None,
+) -> Path:
     """把知识条目渲染并写入输出目录。"""
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{_order_prefix(item.source_order)}-{_safe_filename(item.kb_id)}.md"
+    parts = [
+        source_title,
+        timestamp,
+        trace_id,
+        _order_prefix(item.source_order),
+        item.kb_id,
+    ]
+    filename = "-".join(_safe_filename(part) for part in parts if part)
+    path = output_dir / f"{filename}.md"
     path.write_text(render_markdown(item), encoding="utf-8")
     return path
 
@@ -30,7 +45,7 @@ def render_markdown(item: KnowledgeItem) -> str:
 def _safe_filename(value: str) -> str:
     """把标识符转换为安全文件名。"""
     value = value.lower().strip()
-    value = re.sub(r"[^a-z0-9._-]+", "-", value)
+    value = re.sub(r"[^\w._-]+", "-", value)
     value = re.sub(r"-+", "-", value).strip("-")
     return value or "kb-item"
 

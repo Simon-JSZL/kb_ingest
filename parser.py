@@ -21,7 +21,7 @@ def iter_input_files(input_path: Path) -> List[Path]:
         p for p in input_path.rglob("*")
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
     ]
-    return sorted(files)
+    return sorted(files, key=lambda path: (path.name.lower(), str(path).lower()))
 
 
 def parse_document(path: Path) -> ParsedDocument:
