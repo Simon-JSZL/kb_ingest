@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import patch
@@ -8,15 +9,14 @@ from unittest.mock import patch
 import normalizer
 from normalizer import (
     _build_prompt,
-    _coerce_raw_items,
     _coverage_retry_prompt,
     _extract_response_content,
     _extract_json_with_diagnostics,
-    _fallback_high_relevance_coverage_issues,
-    _high_relevance_facts_from_analysis,
     _item_from_dict,
     _items_with_coverage_warning,
     _json_repair_retry_prompt,
+    _normalize_with_llm,
+    normalize_block,
     _postprocess_item,
     _read_tools,
     _significant_token_overlap,
@@ -98,41 +98,9 @@ tools:
 
         self.assertEqual(_extract_response_content(response), '{"items": [{"title": "工具调用"}]}')
 
-    def test_coerces_gateway_wrapped_json_string_items(self):
-        parsed = {
-            "code": 0,
-            "payload": '{"items": [{"title": "网关包装", "body": "正文"}]}',
-        }
-
-        self.assertEqual(_coerce_raw_items(parsed), [{"title": "网关包装", "body": "正文"}])
 
 
 class NormalizerPostprocessTest(unittest.TestCase):
-    def test_extract_json_repairs_unescaped_quotes_in_category_description(self):
-        content = '''{
-  "items": [
-    {
-      "title": "异常交易规则",
-      "doc_type": "biz",
-      "category": "异常交易",
-      "category_description": "本分类覆盖"异常交易"、'"大额交易"'、"风险处置"等内容。",
-      "category_keywords": ["异常交易"],
-      "business_modules": [],
-      "source_version": "",
-      "risk_level": "low",
-      "applicable_roles": [],
-      "tags": [],
-      "body": "# 异常交易规则\\n\\n## 1. 核心内容\\n\\n正文。\\n\\n## 2. 适用边界\\n\\n原文未明确说明。\\n\\n## 3. 使用要求\\n\\n原文未明确说明。\\n\\n## 4. 关联能力\\n\\n暂无。\\n\\n## 5. 来源依据\\n\\n基于原文回答。",
-      "split_reason": "独立规则"
-    }
-  ]
-}'''
-
-        parsed = _extract_json_with_diagnostics(content).value
-
-        self.assertIsInstance(parsed, dict)
-        self.assertEqual(parsed["items"][0]["title"], "异常交易规则")
-        self.assertIn('"异常交易"', parsed["items"][0]["category_description"])
 
     def test_json_repair_retry_prompt_reports_parse_error(self):
         content = '{"items": [{"title": "异常", "body": "正文",}]}'
@@ -146,6 +114,89 @@ class NormalizerPostprocessTest(unittest.TestCase):
         self.assertIn("只能返回修复后的 JSON object", prompt)
         self.assertIn('根节点必须严格为 {"items": [...]}', prompt)
         self.assertIn("所有字符串内部的英文双引号必须写成", prompt)
+
+    def test_llm_retry_carries_bad_response_into_next_round(self):
+        config = SimpleNamespace(
+            base_url="http://llm",
+            api_key="key",
+            model="glm",
+            max_tokens=1000,
+            temperature=0.1,
+        )
+        block = ParsedBlock(
+            source_doc="doc.md",
+            source_section="章节",
+            content="异常交易需要人工复核。",
+        )
+        calls = []
+
+        def fake_completion(_client, _config, messages):
+            calls.append([dict(message) for message in messages])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": '{"answer":"bad"}'}, "finish_reason": "stop"}]}
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"items":[{"title":"异常交易","body":"# 异常交易\\n\\n## 1. 核心内容\\n异常交易需要人工复核。"}]}'
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+        with patch("normalizer.get_llm_config", return_value=config), \
+            patch("normalizer._get_zhipu_client_class", return_value=lambda **_: object()), \
+            patch("normalizer._create_zhipu_completion", side_effect=fake_completion), \
+            patch("normalizer._source_fact_coverage_issues", return_value=[]), \
+            patch("normalizer.time.sleep"):
+            items = _normalize_with_llm(block, "draft")
+
+        self.assertEqual(items[0].title, "异常交易")
+        self.assertEqual(calls[1][2]["role"], "assistant")
+        self.assertEqual(calls[1][2]["content"], '{"answer":"bad"}')
+        self.assertIn("根节点必须严格为", calls[1][3]["content"])
+
+    def test_llm_bad_shape_exhaustion_falls_back_without_abort(self):
+        config = SimpleNamespace(
+            base_url="http://llm",
+            api_key="key",
+            model="glm",
+            max_tokens=1000,
+            temperature=0.1,
+        )
+        block = ParsedBlock(
+            source_doc="doc.md",
+            source_section="章节",
+            content="异常交易需要人工复核。",
+        )
+
+        with patch("normalizer.LLM_MAX_RETRIES", 1), \
+            patch("normalizer.get_llm_config", return_value=config), \
+            patch("normalizer._get_zhipu_client_class", return_value=lambda **_: object()), \
+            patch(
+                "normalizer._create_zhipu_completion",
+                return_value={"choices": [{"message": {"content": '{"answer":"bad"}'}, "finish_reason": "stop"}]},
+            ), \
+            patch("normalizer.time.sleep"):
+            self.assertEqual(_normalize_with_llm(block, "draft"), [])
+
+    def test_llm_fallback_marks_failed_and_keeps_chunk_source(self):
+        config = SimpleNamespace(enabled=True)
+        block = ParsedBlock(
+            source_doc="doc.md",
+            source_section="章节",
+            content="原始 chunk 内容",
+        )
+
+        with patch("normalizer.get_llm_config", return_value=config), \
+            patch("normalizer._normalize_with_llm", return_value=[]):
+            item = normalize_block(block, "active")[0]
+
+        self.assertEqual(item.review_status, "failed")
+        self.assertIn("WARNING: LLM 多次重试后仍未返回合格 JSON", item.body)
+        self.assertIn("## failed_chunk_source", item.body)
+        self.assertIn("原始 chunk 内容", item.body)
 
     def test_item_uses_clean_model_category_description(self):
         block = ParsedBlock(
@@ -202,7 +253,7 @@ class NormalizerPostprocessTest(unittest.TestCase):
             content=(
                 "#### 3.1 网络支付清算平台 electronics payment clearing of China\n\n"
                 "连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台"
-                "（以下简称“网联平台”），英文简称“EPCC”。"
+                "（以下简称“示例平台”），英文简称“EPCC”。"
             ),
         )
 
@@ -223,14 +274,14 @@ class NormalizerPostprocessTest(unittest.TestCase):
             content=(
                 "#### 3.1 网络支付清算平台 electronics payment clearing of China\n\n"
                 "连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台"
-                "（以下简称“网联平台”），英文简称“EPCC”。"
+                "（以下简称“示例平台”），英文简称“EPCC”。"
             ),
         )
         item = KnowledgeItem(
             kb_id="biz-test-v1",
             title="网络支付清算平台定义",
             doc_type="biz",
-            domain="联合运维",
+            domain="示例运维",
             category="分类",
             category_keywords=[],
             business_modules=[],
@@ -271,7 +322,7 @@ class NormalizerPostprocessTest(unittest.TestCase):
         issues = _source_fact_coverage_issues(block, [item])
 
         self.assertEqual(issues, [
-            "连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台（以下简称“网联平台”），英文简称“EPCC”。"
+            "连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台（以下简称“示例平台”），英文简称“EPCC”。"
         ])
 
     def test_source_fact_coverage_accepts_full_definition(self):
@@ -281,14 +332,14 @@ class NormalizerPostprocessTest(unittest.TestCase):
             content=(
                 "#### 3.1 网络支付清算平台 electronics payment clearing of China\n\n"
                 "连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台"
-                "（以下简称“网联平台”），英文简称“EPCC”。"
+                "（以下简称“示例平台”），英文简称“EPCC”。"
             ),
         )
         item = KnowledgeItem(
             kb_id="biz-test-v1",
             title="网络支付清算平台定义",
             doc_type="biz",
-            domain="联合运维",
+            domain="示例运维",
             category="分类",
             category_keywords=[],
             business_modules=[],
@@ -306,7 +357,7 @@ class NormalizerPostprocessTest(unittest.TestCase):
 
 ## 1. 核心内容
 
-连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台（以下简称“网联平台”），英文简称“EPCC”。
+连接商业银行与非银行支付机构的非银行支付机构网络支付清算平台（以下简称“示例平台”），英文简称“EPCC”。
 
 ## 2. 适用边界
 
@@ -331,7 +382,7 @@ class NormalizerPostprocessTest(unittest.TestCase):
             kb_id="biz-test-v1",
             title="异常交易监控",
             doc_type="biz",
-            domain="联合运维",
+            domain="示例运维",
             category="分类",
             category_keywords=[],
             business_modules=[],
@@ -381,7 +432,7 @@ class NormalizerPostprocessTest(unittest.TestCase):
             kb_id="biz-test-v1",
             title="异常交易监控",
             doc_type="biz",
-            domain="联合运维",
+            domain="示例运维",
             category="分类",
             category_keywords=[],
             business_modules=[],
@@ -420,63 +471,7 @@ class NormalizerPostprocessTest(unittest.TestCase):
         self.assertIn("WARNING: LLM 多次重试后仍未通过来源事实覆盖校验", item.body)
         self.assertIn("异常交易笔数超过 30000 笔时升级处理。", item.body)
 
-    def test_relevance_analysis_keeps_only_high_relevance_missing_facts(self):
-        missing = [
-            "运行监控",
-            "异常交易笔数超过 30000 笔时升级处理。",
-        ]
-        parsed = {
-            "facts": [
-                {"fact": "运行监控", "relevance": "低", "reason": "章节标题"},
-                {
-                    "fact": "异常交易笔数超过 30000 笔时升级处理。",
-                    "relevance": "极高",
-                    "reason": "阈值规则",
-                },
-            ]
-        }
 
-        self.assertEqual(
-            _high_relevance_facts_from_analysis(parsed, missing),
-            ["异常交易笔数超过 30000 笔时升级处理。"],
-        )
-
-    def test_relevance_fallback_filters_structural_title_missing_fact(self):
-        block = ParsedBlock(
-            source_doc="制度.md",
-            source_section="4.1 运行监控",
-            content="运行监控\n\n异常交易笔数超过 30000 笔时升级处理。",
-            subcategory="运行监控",
-        )
-        item = KnowledgeItem(
-            kb_id="biz-test-v1",
-            title="异常交易监控",
-            doc_type="biz",
-            domain="联合运维",
-            category="分类",
-            category_keywords=[],
-            business_modules=[],
-            source_doc=block.source_doc,
-            source_version="",
-            source_section=block.source_section,
-            effective_date="",
-            owner="",
-            confidentiality="内部",
-            risk_level="low",
-            applicable_roles=[],
-            tags=[],
-            status="active",
-            body="# 异常交易监控\n\n## 1. 核心内容\n\n监控异常交易。",
-        )
-
-        self.assertEqual(
-            _fallback_high_relevance_coverage_issues(
-                block,
-                [item],
-                ["运行监控", "异常交易笔数超过 30000 笔时升级处理。"],
-            ),
-            ["异常交易笔数超过 30000 笔时升级处理。"],
-        )
 
     def test_rewrites_hallucinated_function_when_source_is_unrelated(self):
         block = ParsedBlock(
@@ -566,9 +561,9 @@ display_name: "互联互通API接口情况查询"
             source_doc="互联互通.md",
             source_section="监控统计账户类型",
             content="本文说明监控统计账户类型字段 mAccTpCd 的含义，不涉及查询API接入情况、接入时间或某一场景是否接入。",
-            category="网络支付清算平台 联合运维互联互通技术规范",
+            category="网络支付清算平台 示例运维互联互通技术规范",
             category_description="覆盖互联互通技术规范。",
-            category_keywords=["网络支付清算平台", "联合运维", "互联互通"],
+            category_keywords=["网络支付清算平台", "示例运维", "互联互通"],
         )
         item = _item_from_dict(
             {
@@ -576,9 +571,9 @@ display_name: "互联互通API接口情况查询"
                 "body": """# 监控统计账户类型
 
 知识大类说明：
-大类：网络支付清算平台 联合运维互联互通技术规范
+大类：网络支付清算平台 示例运维互联互通技术规范
 说明：覆盖互联互通技术规范。
-关键词：网络支付清算平台、联合运维、互联互通
+关键词：网络支付清算平台、示例运维、互联互通
 
 ## 1. 核心内容
 
@@ -665,7 +660,7 @@ display_name: "互联互通API接口情况查询"
             kb_id="biz-offline-abc-v1",
             title="标题",
             doc_type="biz",
-            domain="联合运维",
+            domain="示例运维",
             category="分类",
             category_keywords=[],
             business_modules=[],
@@ -698,6 +693,41 @@ display_name: "互联互通API接口情况查询"
             path.name,
             "制度-20260610153045-a1b2c3d4-000012-biz-offline-abc-v1.md",
         )
+
+    def test_write_failed_item_marks_filename(self):
+        item = KnowledgeItem(
+            kb_id="biz-offline-abc-v1",
+            title="标题",
+            doc_type="biz",
+            domain="示例运维",
+            category="分类",
+            category_keywords=[],
+            business_modules=[],
+            source_doc="制度.md",
+            source_version="",
+            source_section="1",
+            effective_date="",
+            owner="",
+            confidentiality="内部",
+            risk_level="low",
+            applicable_roles=[],
+            tags=[],
+            status="active",
+            body="# 标题",
+            source_order=12,
+            review_status="failed",
+        )
+
+        with TemporaryDirectory() as tmp:
+            path = write_item(
+                item,
+                Path(tmp),
+                source_title="制度",
+                timestamp="20260610153045",
+                trace_id="a1b2c3d4",
+            )
+
+        self.assertIn("-failed-", path.name)
 
 
 if __name__ == "__main__":

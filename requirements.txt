@@ -1,9 +1,6 @@
-# Offline-only optional dependencies. Do not add these to the app runtime unless needed.
 pyyaml>=6.0.1
 zai-sdk==0.2.2
-sniffio>=1.3.0
 
-# Docling slim plus only file-format backends used by this offline tool.
-# Do not install `docling` or `docling-slim[standard]` here: those pull OCR,
-# layout/table ML models, torch/onnxruntime, and may try to download artifacts.
+# Docling file-format backends only. Avoid docling-slim[standard]: it pulls OCR,
+# layout/table ML models, torch/onnxruntime, and downloaded artifacts.
 docling-slim[format-pdf-docling,format-docx,format-markdown]>=2.70.0; python_version >= "3.10"

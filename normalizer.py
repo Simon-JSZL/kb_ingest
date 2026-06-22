@@ -15,8 +15,8 @@ from app_config import get_llm_config
 from schemas import DOC_TYPES, KnowledgeItem, ParsedBlock
 
 
-DEFAULT_DOMAIN = "网联清算业务"
-DEFAULT_OWNER = "网联清算业务知识库"
+DEFAULT_DOMAIN = "通用业务"
+DEFAULT_OWNER = "通用知识库"
 CURRENT_DIR = Path(__file__).resolve().parent
 KB_SPEC_PATH = CURRENT_DIR / "prompts" / "知识库建立规范.md"
 TOOLS_PATH = CURRENT_DIR / "input" / "function" / "tools.yaml"
@@ -37,15 +37,23 @@ def normalize_block(block: ParsedBlock, status: str = "draft") -> List[Knowledge
         items = _normalize_with_llm(block, status=status)
         if items:
             return [_postprocess_item(item, block) for item in items]
-        _abort_llm("model returned no valid knowledge items", block)
+        print("WARNING: model returned no valid knowledge items; using heuristic fallback")
+        return fallback_failed_block(block, status=status)
     return [_postprocess_item(_normalize_heuristically(block, status=status), block)]
+
+
+def fallback_failed_block(block: ParsedBlock, status: str = "draft") -> List[KnowledgeItem]:
+    """用离线规则生成 failed 兜底条目。"""
+    item = _normalize_heuristically(block, status=status)
+    return [_mark_llm_failed_item(_postprocess_item(item, block), block)]
 
 
 def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
     """调用 LLM 生成条目并处理重试。"""
     config = get_llm_config()
     if not (config.base_url and config.api_key and config.model):
-        _abort_llm("missing base_url, api_key, or model", block)
+        print("WARNING: missing base_url, api_key, or model; using heuristic fallback")
+        return []
 
     base_prompt = _build_prompt(block, status)
     started_at = time.monotonic()
@@ -61,22 +69,15 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
         return []
     client = client_cls(api_key=config.api_key, base_url=config.base_url)
 
-    compact_retry = False
     coverage_retry_count = 0
-    coverage_retry_feedback = ""
-    json_retry_feedback = ""
+    messages = _messages(base_prompt)
     for attempt in range(1, LLM_MAX_RETRIES + 1):
-        prompt = _compact_retry_prompt(base_prompt) if compact_retry else base_prompt
-        if json_retry_feedback:
-            prompt = f"{prompt}\n\n{json_retry_feedback}"
-        if coverage_retry_feedback:
-            prompt = f"{prompt}\n\n{coverage_retry_feedback}"
         try:
             print(
                 "llm request: "
                 f"provider=zhipu base_url={config.base_url} attempt={attempt}/{LLM_MAX_RETRIES}"
             )
-            response = _create_zhipu_completion(client, config, prompt)
+            response = _create_zhipu_completion(client, config, messages)
         except Exception as exc:
             elapsed = time.monotonic() - started_at
             print(
@@ -85,7 +86,8 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
                 f"after {elapsed:.1f}s detail={exc}"
             )
             if attempt >= LLM_MAX_RETRIES:
-                _abort_llm(f"request failed after {LLM_MAX_RETRIES} attempts: {type(exc).__name__}", block)
+                print(f"WARNING: request failed after {LLM_MAX_RETRIES} attempts: {type(exc).__name__}; using heuristic fallback")
+                return []
             time.sleep(min(2 ** (attempt - 1), 30))
             continue
 
@@ -107,14 +109,22 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
                 f"response={_response_debug(response)}"
             )
             if attempt >= LLM_MAX_RETRIES:
-                _abort_llm("empty response content after 10 attempts", block)
+                print(f"WARNING: empty response content after {LLM_MAX_RETRIES} attempts; using heuristic fallback")
+                return []
+            _append_retry_messages(
+                messages,
+                content,
+                "重试补充要求：上一轮响应为空。请只返回一个 JSON object，根节点必须严格为 {\"items\": [...]}。",
+            )
             time.sleep(min(2 ** (attempt - 1), 30))
             continue
 
         parse_result = _extract_json_with_diagnostics(content)
         parsed = parse_result.value
         if not parsed:
-            compact_retry = compact_retry or _looks_truncated(content, finish_reason)
+            retry_prompt = _json_repair_retry_prompt(parse_result.error, content)
+            if _looks_truncated(content, finish_reason):
+                retry_prompt += "\n上一轮响应疑似被截断，本轮请压缩表述但保持 {\"items\": [...]} 根结构。"
             print(
                 "llm parse failed: response is not valid JSON "
                 f"finish_reason={finish_reason or 'unknown'} "
@@ -123,15 +133,17 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
                 f"preview={_preview(content)}"
             )
             if attempt >= LLM_MAX_RETRIES:
-                _abort_llm("response is not valid JSON after 10 attempts", block)
-            json_retry_feedback = _json_repair_retry_prompt(parse_result.error, content)
+                print(f"WARNING: response is not valid JSON after {LLM_MAX_RETRIES} attempts; using heuristic fallback")
+                return []
+            _append_retry_messages(messages, content, retry_prompt)
             time.sleep(min(2 ** (attempt - 1), 30))
             continue
-        json_retry_feedback = ""
 
         raw_items = _coerce_raw_items(parsed)
         if not isinstance(raw_items, list):
-            compact_retry = compact_retry or _looks_truncated(content, finish_reason)
+            retry_prompt = _json_shape_retry_prompt(parsed)
+            if _looks_truncated(content, finish_reason):
+                retry_prompt += "\n上一轮响应疑似被截断，本轮请压缩表述但保持 {\"items\": [...]} 根结构。"
             print(
                 "llm parse failed: JSON does not contain an items list "
                 f"finish_reason={finish_reason or 'unknown'} "
@@ -139,11 +151,11 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
                 f"top_level={_json_shape(parsed)} preview={_preview(content)}"
             )
             if attempt >= LLM_MAX_RETRIES:
-                _abort_llm("JSON does not contain an items list after 10 attempts", block)
-            json_retry_feedback = _json_shape_retry_prompt(parsed)
+                print(f"WARNING: JSON does not contain an items list after {LLM_MAX_RETRIES} attempts; using heuristic fallback")
+                return []
+            _append_retry_messages(messages, content, retry_prompt)
             time.sleep(min(2 ** (attempt - 1), 30))
             continue
-        json_retry_feedback = ""
 
         items: List[KnowledgeItem] = []
         for idx, raw in enumerate(raw_items, start=1):
@@ -154,37 +166,37 @@ def _normalize_with_llm(block: ParsedBlock, status: str) -> List[KnowledgeItem]:
         if items:
             coverage_issues = _source_fact_coverage_issues(block, items)
             if coverage_issues:
-                high_relevance_issues = _high_relevance_coverage_issues(
-                    client, config, block, items, coverage_issues
-                )
-                if not high_relevance_issues:
-                    print(
-                        "llm coverage warning ignored: "
-                        "no highly relevant missing facts after relevance review"
-                    )
-                    return items
                 print(
                     "llm coverage failed: "
                     f"missing_facts={len(coverage_issues)} "
-                    f"high_relevance_missing_facts={len(high_relevance_issues)} "
-                    f"preview={_preview('；'.join(high_relevance_issues[:3]))}"
+                    f"preview={_preview('；'.join(coverage_issues[:3]))}"
                 )
                 if coverage_retry_count >= COVERAGE_MAX_RETRIES or attempt >= LLM_MAX_RETRIES:
                     print(
                         "WARNING: source fact coverage failed after "
                         f"{coverage_retry_count} coverage retries; releasing draft for manual review"
                     )
-                    return _items_with_coverage_warning(items, block, high_relevance_issues)
+                    return _items_with_coverage_warning(items, block, coverage_issues)
                 coverage_retry_count += 1
-                coverage_retry_feedback = _coverage_retry_prompt(block, high_relevance_issues, items)
+                _append_retry_messages(
+                    messages,
+                    content,
+                    _coverage_retry_prompt(block, coverage_issues, items),
+                )
                 time.sleep(min(2 ** (attempt - 1), 30))
                 continue
             return items
         if attempt >= LLM_MAX_RETRIES:
-            _abort_llm("items list contained no valid objects after 10 attempts", block)
+            print(f"WARNING: items list contained no valid objects after {LLM_MAX_RETRIES} attempts; using heuristic fallback")
+            return []
+        _append_retry_messages(
+            messages,
+            content,
+            "重试补充要求：上一轮 items 数组没有可用对象。请返回 {\"items\": [...]}，items 中每个元素都必须是知识库条目对象。",
+        )
         time.sleep(min(2 ** (attempt - 1), 30))
 
-    _abort_llm("model call failed", block)
+    return []
 
 
 def _system_message() -> str:
@@ -204,175 +216,16 @@ def _messages(prompt: str) -> List[Dict[str, str]]:
     ]
 
 
-def _compact_retry_prompt(base_prompt: str) -> str:
-    """构造输出截断后的紧凑重试提示。"""
-    return (
-        base_prompt
-        + "\n\n重试补充要求：上一次输出疑似过长或结构不完整。"
-        "本次必须只生成 1 个 item，保留规范要求的正文 5 个章节，但不能丢失原文事实句。"
-        "不要省略 JSON 外层 items，不要输出多个条目，不要输出解释文字。"
-    )
 
 
-def _high_relevance_coverage_issues(
-    client,
-    config,
-    block: ParsedBlock,
-    items: List[KnowledgeItem],
-    missing_facts: List[str],
-) -> List[str]:
-    """让 LLM 判断缺失事实是否与当前条目高度相关。"""
-    if not missing_facts:
-        return []
-    prompt = _coverage_relevance_prompt(block, items, missing_facts)
-    try:
-        response = _create_zhipu_completion(client, config, prompt)
-        content = _extract_response_content(response)
-        parsed = _extract_json_with_diagnostics(content).value
-        high_relevance = _high_relevance_facts_from_analysis(parsed, missing_facts)
-        if high_relevance is not None:
-            print(
-                "llm coverage relevance: "
-                f"missing_facts={len(missing_facts)} high_relevance={len(high_relevance)}"
-            )
-            return high_relevance
-    except Exception as exc:
-        print(f"llm coverage relevance failed: {type(exc).__name__} detail={exc}")
-
-    fallback = _fallback_high_relevance_coverage_issues(block, items, missing_facts)
-    print(
-        "llm coverage relevance fallback: "
-        f"missing_facts={len(missing_facts)} high_relevance={len(fallback)}"
-    )
-    return fallback
 
 
-def _coverage_relevance_prompt(
-    block: ParsedBlock,
-    items: List[KnowledgeItem],
-    missing_facts: List[str],
-) -> str:
-    """构造缺失事实相关性判定提示。"""
-    fact_lines = "\n".join(f"- {fact}" for fact in missing_facts[:20])
-    current_items = "\n\n".join(
-        f"标题：{item.title}\n核心正文：{_core_sections_for_coverage(item.body)}"
-        for item in items
-    )
-    return f"""
-请判断以下“覆盖校验缺失事实”是否与当前知识条目的主题极高相关。
-
-判定规则：
-1. 只有缺失事实是回答当前条目标题或核心正文所必须保留的定义、规则、阈值、条件、主体、简称、例外或限制时，才标记为“极高”。
-2. 来源文件标题、章节标题、目录项、上级主题名称、页眉页脚、纯标签、仅用于定位的小标题，通常不是“极高”，除非它本身就是当前条目要解释的完整定义或规则。
-3. 辅助上下文只用于理解位置和主题，不要把辅助上下文中独有的信息作为缺失事实依据。
-4. 只能返回 JSON object，不要 Markdown 或解释文字。
-
-返回格式：
-{{
-  "facts": [
-    {{"fact": "必须原样复制待判断事实", "relevance": "极高|一般|低", "reason": "一句话原因"}}
-  ]
-}}
-
-来源文档：{block.source_doc}
-来源章节：{block.source_section or "全文"}
-
-当前来源原文片段：
-{_preview(block.content)[:4000] or "无"}
-
-辅助上下文：
-{_preview(block.context)[:2000] or "无"}
-
-当前已生成条目：
-{_preview(current_items)[:4000] or "无"}
-
-待判断事实：
-{fact_lines}
-""".strip()
 
 
-def _high_relevance_facts_from_analysis(parsed, missing_facts: List[str]):
-    """从相关性判定 JSON 中提取极高相关事实。"""
-    if not isinstance(parsed, dict):
-        return None
-    raw_facts = parsed.get("facts")
-    if raw_facts is None and isinstance(parsed.get("results"), list):
-        raw_facts = parsed.get("results")
-    if raw_facts is None and isinstance(parsed.get("items"), list):
-        raw_facts = parsed.get("items")
-    if not isinstance(raw_facts, list):
-        return None
-
-    missing_by_norm = {_coverage_text(fact): fact for fact in missing_facts}
-    selected: List[str] = []
-    for raw in raw_facts:
-        if not isinstance(raw, dict):
-            continue
-        relevance = str(raw.get("relevance") or raw.get("关联度") or "").strip().lower()
-        if not ("极高" in relevance or "high" in relevance):
-            continue
-        fact = str(raw.get("fact") or raw.get("事实") or raw.get("text") or "").strip()
-        matched = _match_missing_fact(fact, missing_by_norm)
-        if matched and matched not in selected:
-            selected.append(matched)
-    return selected
 
 
-def _match_missing_fact(fact: str, missing_by_norm: Dict[str, str]) -> str:
-    """把模型返回事实匹配回原始缺失事实。"""
-    fact_norm = _coverage_text(fact)
-    if not fact_norm:
-        return ""
-    if fact_norm in missing_by_norm:
-        return missing_by_norm[fact_norm]
-    for missing_norm, missing in missing_by_norm.items():
-        if fact_norm in missing_norm or missing_norm in fact_norm:
-            return missing
-    return ""
 
 
-def _fallback_high_relevance_coverage_issues(
-    block: ParsedBlock,
-    items: List[KnowledgeItem],
-    missing_facts: List[str],
-) -> List[str]:
-    """相关性判定失败时的保守兜底，过滤明显结构性标题。"""
-    return [
-        fact for fact in missing_facts
-        if not _looks_like_structural_missing_fact(block, items, fact)
-    ]
-
-
-def _looks_like_structural_missing_fact(
-    block: ParsedBlock,
-    items: List[KnowledgeItem],
-    fact: str,
-) -> bool:
-    """判断缺失事实是否只是标题、章节或定位信息。"""
-    fact_norm = _coverage_text(fact)
-    if not fact_norm:
-        return True
-    candidates = [
-        block.source_doc,
-        Path(block.source_doc).stem,
-        block.source_section,
-        block.category,
-        block.subcategory,
-        block.source_doc_description,
-        block.subcategory_description,
-        *block.category_path,
-        *block.related_categories,
-        *(item.title for item in items),
-    ]
-    candidate_norms = {_coverage_text(value) for value in candidates if value}
-    if fact_norm in candidate_norms:
-        return True
-    if len(fact_norm) <= 30 and not re.search(
-        r"是|为|指|称|简称|英文|应|需|必须|不得|禁止|超过|低于|大于|小于|不少于|不超过|\d",
-        fact,
-    ):
-        return True
-    return False
 
 
 def _coverage_retry_prompt(
@@ -427,17 +280,23 @@ def _json_shape_retry_prompt(parsed) -> str:
     )
 
 
-def _create_zhipu_completion(client, config, prompt: str):
+def _append_retry_messages(messages: List[Dict[str, str]], previous_content: str, feedback: str) -> None:
+    """把坏返回和纠偏要求放进下一轮会话。"""
+    messages.append({"role": "assistant", "content": previous_content or ""})
+    messages.append({"role": "user", "content": feedback})
+
+
+def _create_zhipu_completion(client, config, messages: List[Dict[str, str]]):
     """发起一次非流式模型补全请求。"""
     return client.chat.completions.create(
         model=config.model,
-        messages=_messages(prompt),
+        messages=messages,
         stream=False,
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         do_sample=False,
         response_format={"type": "json_object"},
-        thinking={"type": "disabled", "clear_thinking": True},
+        thinking={"type": "disabled", "clear_thinking": False},
     )
 
 
@@ -574,69 +433,35 @@ def _json_shape(value) -> str:
     return type(value).__name__
 
 
+def _mark_llm_failed_item(item: KnowledgeItem, block: ParsedBlock) -> KnowledgeItem:
+    """标记 LLM 失败后的离线兜底条目。"""
+    item.review_status = "failed"
+    item.body = _append_failed_chunk_source(item.body, block.content)
+    return item
+
+
+def _append_failed_chunk_source(body: str, source: str) -> str:
+    """在 failed 文件末尾保存原始 chunk。"""
+    warning = (
+        "## LLM 生成失败警告\n\n"
+        "WARNING: LLM 多次重试后仍未返回合格 JSON，本文件由离线规则兜底生成，需人工核对。\n\n"
+        "## failed_chunk_source\n\n"
+        "```text\n"
+        f"{source.strip()}\n"
+        "```"
+    )
+    return f"{body.strip()}\n\n{warning}".strip()
+
+
 def _coerce_raw_items(parsed):
-    """把兼容 JSON 结构转换为 items 列表。"""
-    if isinstance(parsed, dict):
-        items = parsed.get("items")
-        if isinstance(items, list):
-            return items
-
-        for key in (
-            "knowledge_items",
-            "records",
-            "data",
-            "payload",
-            "output",
-            "response",
-            "answer",
-            "content",
-            "message",
-            "result",
-            "results",
-        ):
-            value = parsed.get(key)
-            if isinstance(value, list):
-                print(f"llm parse notice: using non-standard list field '{key}' as items")
-                return value
-            if isinstance(value, dict):
-                nested = _coerce_raw_items(value)
-                if isinstance(nested, list):
-                    print(f"llm parse notice: using nested field '{key}' as items")
-                    return nested
-            if isinstance(value, str) and value.strip():
-                nested = _extract_json_with_diagnostics(value)
-                if nested.value is not None:
-                    nested_items = _coerce_raw_items(nested.value)
-                    if isinstance(nested_items, list):
-                        print(f"llm parse notice: parsed JSON string field '{key}' as items")
-                        return nested_items
-
-        if _looks_like_single_item(parsed):
-            print("llm parse notice: wrapping single item object as items[0]")
-            return [parsed]
-
-    if isinstance(parsed, list):
-        print("llm parse notice: wrapping root array as items")
-        return parsed
-
+    """只接受标准 {"items": [...]} 输出。"""
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return parsed["items"]
     return None
 
 
-def _looks_like_single_item(value: Dict) -> bool:
-    """判断 JSON 对象是否像单个条目。"""
-    required_signal = {"title", "body"}
-    item_fields = {
-        "title",
-        "doc_type",
-        "business_modules",
-        "source_version",
-        "risk_level",
-        "applicable_roles",
-        "tags",
-        "body",
-        "split_reason",
-    }
-    return required_signal.issubset(value.keys()) and len(item_fields.intersection(value.keys())) >= 4
+
+
 
 
 def _looks_truncated(content: str, finish_reason: str) -> bool:
@@ -647,15 +472,6 @@ def _looks_truncated(content: str, finish_reason: str) -> bool:
     if not stripped:
         return False
     return stripped.count("{") > stripped.count("}") or stripped.count("[") > stripped.count("]")
-
-
-def _abort_llm(message: str, block: ParsedBlock) -> None:
-    """输出失败告警并终止 LLM 生成。"""
-    print(
-        "ALERT: llm draft failed; aborting. "
-        f"reason={message} doc={block.source_doc} section={block.source_section}"
-    )
-    raise SystemExit(1)
 
 
 def _build_prompt(block: ParsedBlock, status: str) -> str:
@@ -757,36 +573,21 @@ def _read_tools() -> List[Dict[str, Any]]:
 
 def _extract_json_with_diagnostics(text: str) -> JsonParseResult:
     """提取 JSON 并保留失败诊断。"""
-    text = text.strip()
-    text = _strip_code_fence(text)
+    text = _strip_code_fence(text.strip())
     errors: List[str] = []
     try:
         return JsonParseResult(value=json.loads(text))
     except json.JSONDecodeError as exc:
         errors.append(_json_error_message(exc, text))
 
-    repaired = _repair_json_text(text)
-    if repaired != text:
-        try:
-            print("llm parse notice: repaired unescaped quotes in JSON string fields")
-            return JsonParseResult(value=json.loads(repaired))
-        except json.JSONDecodeError as exc:
-            errors.append(_json_error_message(exc, repaired))
-
     for candidate in _json_candidates(text):
         try:
             return JsonParseResult(value=json.loads(candidate))
         except json.JSONDecodeError as exc:
             errors.append(_json_error_message(exc, candidate))
-            repaired = _repair_json_text(candidate)
-            if repaired != candidate:
-                try:
-                    print("llm parse notice: repaired unescaped quotes in JSON candidate")
-                    return JsonParseResult(value=json.loads(repaired))
-                except json.JSONDecodeError as repair_exc:
-                    errors.append(_json_error_message(repair_exc, repaired))
-                    continue
     return JsonParseResult(error=errors[-1] if errors else "no JSON object or array found")
+
+
 
 
 def _json_error_message(exc: json.JSONDecodeError, text: str) -> str:
@@ -823,130 +624,18 @@ def _json_candidates(text: str) -> List[str]:
     return candidates
 
 
-def _repair_json_text(text: str) -> str:
-    """修复常见的 JSON 字符串引号问题。"""
-    for field in (
-        "title",
-        "category",
-        "category_description",
-        "source_version",
-        "risk_level",
-        "split_reason",
-    ):
-        text = _repair_unescaped_quotes_in_json_field(text, field)
-    return text
 
 
-def _repair_unescaped_quotes_in_json_field(text: str, field: str) -> str:
-    """修复指定 JSON 字段中的未转义引号。"""
-    pattern = re.compile(rf'("{re.escape(field)}"\s*:\s*)"')
-    output = []
-    cursor = 0
-    while True:
-        match = pattern.search(text, cursor)
-        if not match:
-            output.append(text[cursor:])
-            break
-
-        value_start = match.end()
-        closing = _find_json_field_string_end(text, value_start)
-        if closing == -1:
-            output.append(text[cursor:])
-            break
-
-        raw_value = text[value_start:closing]
-        repaired_value = _escape_unescaped_quotes(raw_value)
-        output.append(text[cursor:value_start])
-        output.append(repaired_value)
-        output.append('"')
-        cursor = closing + 1
-
-    return "".join(output)
 
 
-def _find_json_field_string_end(text: str, start: int) -> int:
-    """定位 JSON 字符串字段的结束引号。"""
-    idx = start
-    escaped = False
-    while idx < len(text):
-        char = text[idx]
-        if escaped:
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == '"' and _looks_like_json_value_end(text, idx):
-            return idx
-        idx += 1
-    return -1
 
 
-def _looks_like_json_value_end(text: str, quote_idx: int) -> bool:
-    """判断引号是否像 JSON 值结尾。"""
-    next_idx = _next_nonspace(text, quote_idx + 1)
-    if next_idx >= len(text):
-        return True
-    if text[next_idx] in "}]":
-        return True
-    if text[next_idx] != ",":
-        return False
-
-    following = _next_nonspace(text, next_idx + 1)
-    if following >= len(text):
-        return True
-    if text[following] in "}]":
-        return True
-    if text[following] != '"':
-        return False
-
-    key_end = _find_plain_json_string_end(text, following + 1)
-    if key_end == -1:
-        return False
-    after_key = _next_nonspace(text, key_end + 1)
-    return after_key < len(text) and text[after_key] == ":"
 
 
-def _next_nonspace(text: str, start: int) -> int:
-    """查找下一个非空白字符位置。"""
-    idx = start
-    while idx < len(text) and text[idx].isspace():
-        idx += 1
-    return idx
 
 
-def _find_plain_json_string_end(text: str, start: int) -> int:
-    """定位普通 JSON 字符串结束位置。"""
-    idx = start
-    escaped = False
-    while idx < len(text):
-        char = text[idx]
-        if escaped:
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == '"':
-            return idx
-        idx += 1
-    return -1
 
 
-def _escape_unescaped_quotes(value: str) -> str:
-    """转义字符串中的裸双引号。"""
-    output = []
-    escaped = False
-    for char in value:
-        if escaped:
-            output.append(char)
-            escaped = False
-            continue
-        if char == "\\":
-            output.append(char)
-            escaped = True
-            continue
-        if char == '"':
-            output.append('\\"')
-            continue
-        output.append(char)
-    return "".join(output)
 
 
 def _preview(text: str) -> str:

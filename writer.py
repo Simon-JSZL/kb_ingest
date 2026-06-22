@@ -22,6 +22,7 @@ def write_item(
         source_title,
         timestamp,
         trace_id,
+        "failed" if item.review_status == "failed" else None,
         _order_prefix(item.source_order),
         item.kb_id,
     ]

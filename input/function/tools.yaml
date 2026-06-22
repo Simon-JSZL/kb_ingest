@@ -1,0 +1,27 @@
+tools:
+  - name: "query_member_change_announcements"
+    display_name: "查询成员机构变更通知"
+    description: "查询成员机构近期变更、变更报备、计划变更、执行评价以及影响范围。"
+    trigger: "当用户询问成员机构变更通知、变更报备、计划变更或执行评价时优先调用。"
+    input_schema:
+      type: "object"
+      properties:
+        orgCode:
+          type: "string"
+          description: "成员机构金融编码，通常由 resolve_member_org 工具获得。"
+      required: ["orgCode"]
+    output_schema:
+      type: "array"
+      description: "匹配到的成员机构变更通知列表。"
+      items:
+        type: "object"
+        properties:
+          member_code:
+            type: "string"
+            description: "成员机构编码。"
+          member_name:
+            type: "string"
+            description: "成员机构名称。"
+          change_type:
+            type: "string"
+            description: "变更类型。"

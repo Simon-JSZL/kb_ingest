@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import List
 from uuid import uuid4
 
+import yaml
+
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 from app_config import get_draft_config
-from normalizer import normalize_block
+from normalizer import fallback_failed_block, normalize_block
 from parser import iter_input_files, parse_document
 from schemas import ParsedBlock
 from splitter import split_blocks
@@ -58,6 +60,8 @@ def cmd_draft(args) -> int:
             return 0
         if action == "rebuild":
             _clear_generated_files(output_dir)
+        elif action == "retry":
+            return _retry_failed_files(output_dir, status=args.status)
         elif action == "resume":
             resume_state = _load_progress(progress_path)
             if not resume_state:
@@ -114,39 +118,22 @@ def cmd_draft(args) -> int:
             try:
                 items = normalize_block(block, status=args.status)
             except SystemExit as exc:
-                _save_progress(
-                    progress_path,
-                    input_path=input_path,
-                    output_dir=output_dir,
-                    files=files,
-                    run_timestamp=run_timestamp,
-                    run_trace_id=run_trace_id,
-                    source_order=source_order,
-                    total_items=total_items,
-                    file_index=file_index,
-                    block_index=block_index,
-                    status="failed",
-                    error=f"SystemExit({exc.code})",
-                )
-                print(
-                    "checkpoint saved. "
-                    f"file={path.name} block={block_index + 1}/{len(blocks)} "
-                    f"progress={progress_path}"
-                )
-                raise
-            for item in items:
-                source_order += 1
-                item.source_order = source_order
-                item.source_pages = sorted(set(block.pages))
-                item.source_trace = _source_trace(block)
-                write_item(
-                    item,
-                    output_dir,
-                    source_title=Path(block.source_doc).stem,
-                    timestamp=run_timestamp,
-                    trace_id=run_trace_id,
-                )
-                total_items += 1
+                print(f"WARNING: block failed with SystemExit({exc.code}); writing failed fallback")
+                items = fallback_failed_block(block, status=args.status)
+            except Exception as exc:
+                print(f"WARNING: block failed with {type(exc).__name__}: {exc}; writing failed fallback")
+                items = fallback_failed_block(block, status=args.status)
+            if not items:
+                items = fallback_failed_block(block, status=args.status)
+            source_order, written = _write_items(
+                items,
+                output_dir,
+                block,
+                source_order=source_order,
+                run_timestamp=run_timestamp,
+                run_trace_id=run_trace_id,
+            )
+            total_items += written
             _save_progress(
                 progress_path,
                 input_path=input_path,
@@ -178,20 +165,144 @@ def _list_effective_files(path: Path) -> list[Path]:
     )
 
 
+def _write_items(
+    items,
+    output_dir: Path,
+    block: ParsedBlock,
+    *,
+    source_order: int,
+    run_timestamp: str,
+    run_trace_id: str,
+) -> tuple[int, int]:
+    written = 0
+    for item in items:
+        source_order += 1
+        item.source_order = source_order
+        item.source_pages = sorted(set(block.pages))
+        item.source_trace = _source_trace(block)
+        write_item(
+            item,
+            output_dir,
+            source_title=Path(block.source_doc).stem,
+            timestamp=run_timestamp,
+            trace_id=run_trace_id,
+        )
+        written += 1
+    return source_order, written
+
+
+def _retry_failed_files(output_dir: Path, status: str) -> int:
+    failed_files = [path for path in _list_effective_files(output_dir) if "failed" in path.stem.lower()]
+    if not failed_files:
+        print("done. failed_files=0 retried=0")
+        return 0
+
+    run_timestamp = _make_timestamp()
+    run_trace_id = uuid4().hex[:8]
+    retried = 0
+    succeeded = 0
+    still_failed = 0
+    for path in failed_files:
+        block = _block_from_failed_file(path)
+        if not block:
+            print(f"WARNING: skipped failed file without chunk source: {path}")
+            continue
+        try:
+            items = normalize_block(block, status=status)
+        except SystemExit as exc:
+            print(f"WARNING: retry failed with SystemExit({exc.code}); keeping failed fallback: {path}")
+            items = fallback_failed_block(block, status=status)
+        except Exception as exc:
+            print(f"WARNING: retry failed with {type(exc).__name__}: {exc}; keeping failed fallback: {path}")
+            items = fallback_failed_block(block, status=status)
+        if not items:
+            items = fallback_failed_block(block, status=status)
+
+        source_order = max(int(block.order or 0) - 1, 0)
+        _, written = _write_items(
+            items,
+            output_dir,
+            block,
+            source_order=source_order,
+            run_timestamp=run_timestamp,
+            run_trace_id=run_trace_id,
+        )
+        if written:
+            path.unlink()
+        retried += 1
+        if any(item.review_status == "failed" for item in items):
+            still_failed += 1
+        else:
+            succeeded += 1
+    print(f"done. failed_files={len(failed_files)} retried={retried} succeeded={succeeded} still_failed={still_failed}")
+    return 0
+
+
+def _block_from_failed_file(path: Path) -> ParsedBlock | None:
+    text = path.read_text(encoding="utf-8")
+    metadata = _front_matter(text)
+    source = _failed_chunk_source(text)
+    if not source:
+        return None
+    return ParsedBlock(
+        source_doc=str(metadata.get("source_doc") or path.stem),
+        source_section=str(metadata.get("source_section") or ""),
+        content=source,
+        pages=[int(page) for page in metadata.get("source_pages") or [] if str(page).isdigit()],
+        order=int(metadata.get("source_order") or 0),
+        category=str(metadata.get("category") or ""),
+        category_keywords=[str(item) for item in metadata.get("category_keywords") or []],
+        source_doc_description=str(metadata.get("source_doc_description") or ""),
+        subcategory=str(metadata.get("subcategory") or ""),
+        category_path=[str(item) for item in metadata.get("category_path") or []],
+        related_categories=[str(item) for item in metadata.get("related_categories") or []],
+        relation_notes=[str(item) for item in metadata.get("relation_notes") or []],
+        related_items=metadata.get("related_items") or [],
+    )
+
+
+def _front_matter(text: str) -> dict:
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}
+    data = yaml.safe_load(text[4:end]) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _failed_chunk_source(text: str) -> str:
+    marker = "## failed_chunk_source"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    source = text[start + len(marker):].strip()
+    if source.startswith("```"):
+        first_line = source.find("\n")
+        if first_line >= 0:
+            source = source[first_line + 1:]
+        if source.endswith("```"):
+            source = source[:-3]
+    return source.strip()
+
+
 def _choose_existing_result_action(output_dir: Path, existing: list[Path]) -> str:
     """询问用户如何处理已有生成结果。"""
     print(f"found {len(existing)} existing file(s) in {output_dir}.")
     print("Choose how to continue:")
     print("1. delete and rebuild")
     print("2. resume from checkpoint")
-    print("3. exit")
-    answer = input("Select [1/2/3]: ").strip().lower().translate(
-        str.maketrans({"１": "1", "２": "2", "３": "3"})
+    print("3. retry failed files")
+    print("4. exit")
+    answer = input("Select [1/2/3/4]: ").strip().lower().translate(
+        str.maketrans({"１": "1", "２": "2", "３": "3", "４": "4"})
     )
     if answer.startswith("1") or answer in {"d", "delete", "rebuild", "r"}:
         return "rebuild"
     if answer.startswith("2") or answer in {"resume", "continue", "c"}:
         return "resume"
+    if answer.startswith("3") or answer in {"retry", "failed", "f"}:
+        return "retry"
     return "exit"
 
 

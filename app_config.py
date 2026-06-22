@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -15,7 +14,7 @@ DEFAULT_CONFIG_PATH = CURRENT_DIR / "config" / "config.yaml"
 
 @dataclass(frozen=True)
 class LlmConfig:
-    """LLM 调用配置，支持配置文件和环境变量覆盖。"""
+    """LLM 调用配置。"""
     enabled: bool = False
     base_url: str = ""
     api_key: str = ""
@@ -35,67 +34,56 @@ class DraftConfig:
 
 @lru_cache(maxsize=1)
 def get_llm_config() -> LlmConfig:
-    """读取并合并 LLM 配置。"""
+    """读取 LLM 配置。"""
     raw = _read_config().get("llm", {})
     if not isinstance(raw, dict):
         raw = {}
 
     return LlmConfig(
-        enabled=_env_bool("KB_LLM_ENABLED", _as_bool(raw.get("enabled"), False)),
-        base_url=os.environ.get("KB_LLM_BASE_URL", str(raw.get("base_url") or "")),
-        api_key=os.environ.get("KB_LLM_API_KEY", str(raw.get("api_key") or "")),
-        model=os.environ.get("KB_LLM_MODEL", str(raw.get("model") or "")),
-        timeout_seconds=_env_int("KB_LLM_TIMEOUT_SECONDS", raw.get("timeout_seconds"), 120),
-        max_tokens=_env_int("KB_LLM_MAX_TOKENS", raw.get("max_tokens"), 4096),
-        temperature=_env_float("KB_LLM_TEMPERATURE", raw.get("temperature"), 0.1),
+        enabled=_as_bool(raw.get("enabled"), False),
+        base_url=str(raw.get("base_url") or ""),
+        api_key=str(raw.get("api_key") or ""),
+        model=str(raw.get("model") or ""),
+        timeout_seconds=_as_int(raw.get("timeout_seconds"), 120),
+        max_tokens=_as_int(raw.get("max_tokens"), 4096),
+        temperature=_as_float(raw.get("temperature"), 0.1),
     )
 
 
 @lru_cache(maxsize=1)
 def get_draft_config() -> DraftConfig:
-    """读取并合并草稿生成配置。"""
+    """读取草稿生成配置。"""
     raw = _read_config().get("draft", {})
     if not isinstance(raw, dict):
         raw = {}
 
     return DraftConfig(
-        max_chars=_env_int("KB_DRAFT_MAX_CHARS", raw.get("max_chars"), 3600),
-        context_chars=_env_int("KB_DRAFT_CONTEXT_CHARS", raw.get("context_chars"), 800),
-        outline_max_sections=_env_int("KB_DRAFT_OUTLINE_MAX_SECTIONS", raw.get("outline_max_sections"), 40),
+        max_chars=_as_int(raw.get("max_chars"), 3600),
+        context_chars=_as_int(raw.get("context_chars"), 800),
+        outline_max_sections=_as_int(raw.get("outline_max_sections"), 40),
     )
 
 
 def _read_config() -> Dict[str, Any]:
     """读取 YAML 配置文件并返回字典。"""
-    path = Path(os.environ.get("KB_INGEST_CONFIG", DEFAULT_CONFIG_PATH))
-    if not path.exists():
+    if not DEFAULT_CONFIG_PATH.exists():
         return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
     return data if isinstance(data, dict) else {}
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    """读取布尔环境变量并回退到默认值。"""
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return _as_bool(value, default)
-
-
-def _env_int(name: str, value: Any, default: int) -> int:
-    """读取整数环境变量并回退到默认值。"""
-    raw = os.environ.get(name, value)
+def _as_int(value: Any, default: int) -> int:
+    """把配置值转换为整数。"""
     try:
-        return int(raw)
+        return int(value)
     except (TypeError, ValueError):
         return default
 
 
-def _env_float(name: str, value: Any, default: float) -> float:
-    """读取浮点环境变量并回退到默认值。"""
-    raw = os.environ.get(name, value)
+def _as_float(value: Any, default: float) -> float:
+    """把配置值转换为浮点数。"""
     try:
-        return float(raw)
+        return float(value)
     except (TypeError, ValueError):
         return default
 

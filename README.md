@@ -12,23 +12,11 @@
 
 启用大模型时，工具只会读取 `prompts/知识库建立规范.md` 作为格式和质量约束，并由代码按当前片段、辅助上下文和输出 JSON 结构组装生成提示词。模型需依据原文语义判断业务场景、模块、角色、标签和风险等级；代码中的启发式生成只作为未启用大模型时的兜底，不使用预设业务关键词去指导大模型输出。
 
-## 安装可选依赖
-
-不建议把这些依赖加入项目根 `requirements.txt`。离线机器单独安装即可：
+## 安装依赖
 
 ```bash
 python -m pip install -r requirements.txt
 ```
-
-解析层不使用 OCR，不加载本地视觉/版面模型，也不访问远程模型服务：
-
-- PDF：使用 `docling-parse` 抽取 PDF 内嵌文本和文本行顺序；扫描件或图片型 PDF 不会识别。
-- DOCX：使用 Docling 的 Word 后端转为 Markdown。
-- 旧版 `.doc`：通过 LibreOffice `soffice` 转为 `.docx` 后再解析；不使用 OCR。
-- Markdown / TXT：作为已文本化材料直接读取。
-
-不要安装 `docling` 或 `docling-slim[standard]`，它们会引入 OCR、版面/表格模型、Torch/ONNXRuntime 等重依赖，并可能在运行时下载模型。内网机器建议为离线工具单独准备 Python 3.10+ 环境。
-
 ## 基本用法
 
 把文件放入：
@@ -36,6 +24,8 @@ python -m pip install -r requirements.txt
 ```text
 input/
 ```
+
+工具调用示例放在 `input/function/tools.yaml` 中，可按业务需要替换。
 
 生成知识库文件：
 
@@ -67,7 +57,7 @@ python ingest.py validate
 
 ## 大模型配置
 
-默认不强制调用大模型，会使用启发式模板生成知识库文件。
+默认不强制调用大模型，但是强烈建议启用大模型分析，会使用启发式模板生成知识库文件。
 
 如果要启用大模型整理，修改 `config/config.yaml`：
 
@@ -75,7 +65,7 @@ python ingest.py validate
 llm:
   enabled: true
   base_url: "https://open.bigmodel.cn/api/paas/v4/"
-  api_key: "your-zhipu-api-key"
+  api_key: ""
   model: "glm-4.7"
   timeout_seconds: 120
   max_tokens: 8192
@@ -87,19 +77,4 @@ draft:
   outline_max_sections: 40
 ```
 
-也可以继续使用环境变量覆盖配置文件：
-
-```bash
-export KB_LLM_ENABLED=true
-export KB_LLM_BASE_URL="https://open.bigmodel.cn/api/paas/v4/"
-export KB_LLM_API_KEY="your-zhipu-api-key"
-export KB_LLM_MODEL="glm-4.7"
-```
-
 工具通过 Z.AI 新版 Python SDK 调用中文智谱开放平台 GLM，依赖固定为 `zai-sdk==0.2.2`，客户端固定使用官方中文写法 `from zai import ZhipuAiClient`，`base_url` 使用 `https://open.bigmodel.cn/api/paas/v4/`。工具不再包含旧 `zhipuai` SDK、国际版 `ZaiClient` 或 OpenAI 调用路径，也不 import 项目 `src` 代码。
-
-## 与线上项目的关系
-
-这个工具只产出符合规范的 `*.md` 文件到 `result/`，后续由线上知识库加载流程处理。
-
-建议线上打包时排除整个 `tools/kb_ingest` 目录。

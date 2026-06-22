@@ -13,7 +13,7 @@ class ValidatorQualityTest(unittest.TestCase):
 kb_id: biz-offline-test-v1
 title: 网络支付清算平台定义
 doc_type: biz
-domain: 联合运维
+domain: 通用业务
 category: 互联互通技术规范
 category_description: 说明
 category_keywords: []
@@ -21,7 +21,7 @@ business_modules: []
 source_doc: 互联互通机制规范.md
 source_version: V1.3
 source_section: 3.1 网络支付清算平台 electronics payment clearing of China
-owner: 联合运维知识库
+owner: 示例运维知识库
 confidentiality: 内部
 risk_level: low
 applicable_roles: []
@@ -67,7 +67,7 @@ status: active
 kb_id: biz-offline-test-v1
 title: 网络支付清算平台定义
 doc_type: biz
-domain: 联合运维
+domain: 通用业务
 category: 互联互通技术规范
 category_description: 说明
 category_keywords: []
@@ -75,7 +75,7 @@ business_modules: []
 source_doc: 互联互通机制规范.md
 source_version: V1.3
 source_section: 3.1 网络支付清算平台
-owner: 联合运维知识库
+owner: 示例运维知识库
 confidentiality: 内部
 risk_level: low
 applicable_roles: []

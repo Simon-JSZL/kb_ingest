@@ -11,10 +11,11 @@ from ingest import (
     PROGRESS_FILENAME,
     _choose_existing_result_action,
     _load_progress,
+    _retry_failed_files,
     _save_progress,
     cmd_draft,
 )
-from schemas import ParsedBlock, ParsedDocument
+from schemas import KnowledgeItem, ParsedBlock, ParsedDocument
 
 
 class DraftResumeTest(unittest.TestCase):
@@ -88,7 +89,7 @@ class DraftResumeTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertFalse(old.exists())
 
-    def test_choose_existing_result_action_supports_three_choices(self):
+    def test_choose_existing_result_action_supports_retry_choice(self):
         with TemporaryDirectory() as tmp:
             output_dir = Path(tmp)
             existing = [output_dir / "old.md"]
@@ -111,8 +112,71 @@ class DraftResumeTest(unittest.TestCase):
             with patch("builtins.input", return_value="3"):
                 self.assertEqual(
                     _choose_existing_result_action(output_dir, existing),
+                    "retry",
+                )
+            with patch("builtins.input", return_value="4"):
+                self.assertEqual(
+                    _choose_existing_result_action(output_dir, existing),
                     "exit",
                 )
+
+    def test_retry_failed_file_replaces_successful_result(self):
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            failed = output_dir / "doc-20260622000000-trace-failed-000001-biz-offline-old-v1.md"
+            failed.write_text(
+                """---
+title: 旧标题
+source_doc: doc.md
+source_section: 1
+source_pages:
+- 2
+source_order: 1
+category: 测试
+category_keywords: []
+review_status: failed
+---
+
+# 旧标题
+
+## failed_chunk_source
+
+```text
+原始 chunk 内容
+```
+""",
+                encoding="utf-8",
+            )
+            item = KnowledgeItem(
+                kb_id="biz-offline-new-v1",
+                title="新标题",
+                doc_type="biz",
+                domain="通用业务",
+                category="测试",
+                category_keywords=[],
+                business_modules=[],
+                source_doc="doc.md",
+                source_version="",
+                source_section="1",
+                effective_date="",
+                owner="通用知识库",
+                confidentiality="internal",
+                risk_level="low",
+                applicable_roles=[],
+                tags=[],
+                status="active",
+                body="# 新标题\n\n## 1. 核心内容\n重建成功",
+                review_status="pending",
+            )
+
+            with patch("ingest.normalize_block", return_value=[item]):
+                code = _retry_failed_files(output_dir, status="active")
+
+            outputs = sorted(path.name for path in output_dir.glob("*.md"))
+
+        self.assertEqual(code, 0)
+        self.assertFalse(any("failed" in name for name in outputs))
+        self.assertTrue(any("biz-offline-new-v1" in name for name in outputs))
 
     def test_progress_file_round_trips_resume_position(self):
         with TemporaryDirectory() as tmp:
